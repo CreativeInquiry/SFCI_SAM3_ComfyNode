@@ -2,7 +2,6 @@
 nodes.py — EasyTrack nodes on top of ComfyUI's native SAM3 nodes.
 
     SAM3TrackToTracks : SAM3_TRACK_DATA -> TRACKS  (point + box + contour + mask)
-    EasyTracksMerge   : TRACKS + TRACKS -> TRACKS   (collate chunked batches)
     EasyTracksExport  : TRACKS -> json | csv | svg  (one consolidated file)
     EasyTracksLoad    : tracks.json -> TRACKS
     EasyTracksPreview : TRACKS + IMAGE -> IMAGE
@@ -125,54 +124,8 @@ class SAM3TrackToTracks:
         return (tracks,)
 
 
-# ---- 2) collator: merge chunked batches into one TRACKS ---------------------
 
-class EasyTracksMerge:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "tracks_a": ("TRACKS",),
-                "tracks_b": ("TRACKS",),
-                "frame_mode": (["append", "overlay"], {"default": "append"}),
-                "id_mode": (["keep", "offset"], {"default": "keep"}),
-            }
-        }
-
-    RETURN_TYPES = ("TRACKS",)
-    RETURN_NAMES = ("tracks",)
-    FUNCTION = "merge"
-    CATEGORY = "EasyTrack"
-
-    def merge(self, tracks_a, tracks_b, frame_mode="append", id_mode="keep"):
-        # append: b's frames continue after a (chunked video). overlay: same timeline.
-        out = Tracks(height=tracks_a.height or tracks_b.height,
-                     width=tracks_a.width or tracks_b.width,
-                     num_frames=tracks_a.num_frames, fps=tracks_a.fps)
-        for oid, obj in tracks_a.objects.items():
-            out.objects[oid] = obj
-
-        frame_offset = tracks_a.num_frames if frame_mode == "append" else 0
-        id_offset = (max(tracks_a.ids()) + 1) if (id_mode == "offset" and tracks_a.objects) else 0
-
-        for oid, obj in tracks_b.objects.items():
-            new_id = oid + id_offset
-            tgt = out.objects.get(new_id)
-            if tgt is None:
-                from .tracks import TrackObject
-                tgt = TrackObject(object_id=new_id, label=obj.label, score=obj.score)
-                out.objects[new_id] = tgt
-            for fidx, det in obj.frames.items():
-                tgt.frames[fidx + frame_offset] = det
-
-        out.num_frames = (tracks_a.num_frames + tracks_b.num_frames
-                          if frame_mode == "append"
-                          else max(tracks_a.num_frames, tracks_b.num_frames))
-        print(f"[EasyTrack] merged -> {out!r}")
-        return (out,)
-
-
-# ---- 3) export: one consolidated file, json | csv | svg ---------------------
+# ---- 2) export: one consolidated file, json | csv | svg ---------------------
 
 class EasyTracksExport:
     @classmethod
@@ -252,7 +205,7 @@ class EasyTracksExport:
 class EasyTracksLoad:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"path": ("STRING", {"default": "output/tracks.json"})}}
+        return {"required": {"path": ("STRING", {"default": "input/tracks.json"})}}
 
     RETURN_TYPES = ("TRACKS",)
     RETURN_NAMES = ("tracks",)
@@ -271,7 +224,7 @@ class EasyTracksLoad:
             return (Tracks.from_dict(json.load(f)),)
 
 
-# ---- 4) preview: point + box + contour --------------------------------------
+# ---- 3) preview: point + box + contour --------------------------------------
 
 class EasyTracksPreview:
     @classmethod
