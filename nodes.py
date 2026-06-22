@@ -266,13 +266,16 @@ class EasyTracksPreview:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
                 "tracks": ("TRACKS",),
                 "draw_boxes": ("BOOLEAN", {"default": True}),
                 "draw_contours": ("BOOLEAN", {"default": True}),
                 "draw_points": ("BOOLEAN", {"default": True}),
                 "draw_ids": ("BOOLEAN", {"default": True}),
-            }
+            },
+            "optional": {
+                # leave unconnected for a black debug canvas sized to the tracks
+                "images": ("IMAGE",),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -280,9 +283,16 @@ class EasyTracksPreview:
     FUNCTION = "render"
     CATEGORY = "EasyTrack"
 
-    def render(self, images, tracks, draw_boxes, draw_contours, draw_points, draw_ids):
+    def render(self, tracks, draw_boxes, draw_contours, draw_points, draw_ids, images=None):
         import cv2
-        out = [f.copy() for f in comfy_to_frames(images)]
+        if images is not None:
+            out = [f.copy() for f in comfy_to_frames(images)]
+        else:
+            # debug view: blank black frames at the tracks' own resolution
+            H = max(int(tracks.height), 1)
+            W = max(int(tracks.width), 1)
+            n = max(int(tracks.num_frames), 1)
+            out = [np.zeros((H, W, 3), np.uint8) for _ in range(n)]
         for oid, obj in tracks.objects.items():
             color = color_for_id(oid)
             for fi, det in obj.frames.items():
