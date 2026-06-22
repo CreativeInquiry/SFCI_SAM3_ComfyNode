@@ -2,7 +2,6 @@
 
 from .nodes import (
     SAM3TrackToTracks,
-    EasyTracksMerge,
     EasyTracksExport,
     EasyTracksLoad,
     EasyTracksPreview,
@@ -10,7 +9,6 @@ from .nodes import (
 
 NODE_CLASS_MAPPINGS = {
     "SAM3TrackToTracks": SAM3TrackToTracks,
-    "EasyTracksMerge": EasyTracksMerge,
     "EasyTracksExport": EasyTracksExport,
     "EasyTracksLoad": EasyTracksLoad,
     "EasyTracksPreview": EasyTracksPreview,
@@ -18,7 +16,6 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3TrackToTracks": "SAM3 Track \u2192 Tracks",
-    "EasyTracksMerge": "Tracks Merge (collate batches)",
     "EasyTracksExport": "Tracks Export (json/csv/svg)",
     "EasyTracksLoad": "Tracks Load (JSON)",
     "EasyTracksPreview": "Tracks Preview",
