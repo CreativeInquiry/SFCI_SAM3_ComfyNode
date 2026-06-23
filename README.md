@@ -2,7 +2,7 @@
 
 *By Claire Vlases*
 
-**Inport a video, follow the objects in it, and get their positions out as data
+**Import a video, follow the objects in it, and get their positions out as data
 you can actually use.**
 
 This is a small set of ComfyUI nodes for students and artists who want to take
@@ -156,17 +156,80 @@ time?" is a direct lookup. Here's the JSON shape:
 - **SVG** is a vector file where each frame is a layer group containing the
   outlines, boxes, and points, each tagged with its object id and label.
 
-If an object isn't in a frame (it left, or was hidden), it simply has no entry
-for that frame — that's how you know it was absent.
+
+
+### Understanding the scary `mask_rle` string
+ 
+The point, box, and contour are all plain numbers. But `mask_rle` looks like
+this:
+ 
+```
+"counts": "ShT571LS`0k0E8L5I6K5K5L4J9H5L2N2N2N3M..."
+```
+ 
+It's a **compressed mask**, in the
+standard **COCO** format (produced by the `pycocotools` library). 
+
+**A mask is just a grid of 0s and 1s**. 1 where the object is, 0 where it
+isn't. Storing every pixel of a 960×540 mask would be half a million numbers
+per object per frame. Way too much.
+ 
+**So we store "runs" instead.** Instead of `0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0`
+we store the *lengths* of each run: "6 zeros, then 6 ones, then 4 zeros" →
+`[6, 6, 4]`. That's **run-length encoding (RLE)**. Two rules to know:
+ 
+- It's read **column by column** (top to bottom, then the next column), not
+  left to right. (This is a COCO convention.)
+- The first number is always how many **background** pixels come first, so a run
+  list always starts with the count of 0s.
+For example, this 4×4 mask:
+ 
+```
+0 0 1 0
+0 0 1 0
+0 1 1 0
+0 1 1 0
+```
+ 
+read down the columns becomes `0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0`, i.e.
+**6 zeros, 6 ones, 4 zeros → `[6, 6, 4]`**. 
+ 
+**Why the long gibberish, then?** The final step packs those run-length numbers
+into printable text characters (a few bits per character) so the whole mask is a
+short, text-safe string that fits cleanly in JSON. Small numbers can come out
+looking almost readable (our `[6,6,4]` encodes to the string `"664"`), but real
+masks have big run lengths, so they pack into that wall of symbols. The
+`"size": [height, width]` next to it just records the mask's dimensions.
+ 
+To read one in Python:
+ 
+```python
+from pycocotools import mask as mask_utils
+ 
+rle = { "size": [240, 320], "counts": "...the string..." }
+rle["counts"] = rle["counts"].encode("ascii")   # JSON stores it as text
+binary = mask_utils.decode(rle)                  # -> HxW array of 0s and 1s
+# mask_utils.area(rle) also gives the pixel count directly
+```
+ 
+**When can you ignore it?** Most of the time. If you only want the shape, use
+the `contour` (or the SVG export). The
+`mask_rle` is there for when you need the *exact* pixels (precise area, holes,
+re-creating the mask, compositing). Don't need that? Set `store_mask_rle` to
+**off** and the field disappears, making your files much smaller.
+ 
+
+
+
 
 ---
 
 ## 6. Two settings worth understanding
 
-**`store_mask_rle` vs `store_contour` — are they the same?** No.
-- **Contour** is a *simplified outline* — just the outer edge, smoothed. Small
+**`store_mask_rle` vs `store_contour` —- are they the same?** No.
+- **Contour** is a *simplified outline*: just the outer edge, smoothed. Small
   and perfect for vector tools, but it rounds off fine detail and ignores holes.
-- **Mask RLE** is the *exact pixel truth* — every pixel, losslessly, including
+- **Mask RLE** is the *exact pixel truth*: every pixel, including
   holes (a donut shape) and tiny nooks. Use it for precise area, re-creating
   the mask, or compositing.
 Keep both, or turn `store_mask_rle` off for much smaller files when you only
@@ -182,108 +245,9 @@ a smooth blob). Lower = more faithful, higher = smaller.
 
 ## 7. Installing it
 
-1. Copy the `ComfyUI-EasyTrack` folder into `ComfyUI/custom_nodes/`.
-2. Install the helper libraries into ComfyUI's Python:
-   `pip install -r requirements.txt`
-3. **Get the SAM3 weights — they do not download automatically.** Request
-   access to `facebook/sam3` on HuggingFace, download the checkpoint, and place
-   it where ComfyUI loads models. Your ComfyUI must be recent enough to include
-   the built-in SAM3 nodes.
-4. Restart ComfyUI (a full server restart, not just a browser refresh).
+1. Run the built in [Sam 3.1 workflow in RunComfy](https://www.runcomfy.com/comfyui-workflows/sam-3-1-comfyui-workflow-native-segmentation-and-video-tracking)
+2. Install the `ComfyUI-EasyTrack` folder into `ComfyUI/custom_nodes/` using git install via node manager.
+3. Restart ComfyUI + browser refresh.
 
-> Heads up: SAM3 is large and not fast. Test on short clips first.
 
 ---
-
-## 8. Testing it (without waiting on SAM3)
-
-There's a ready-made `examples/sample_tracks.json` with a fake "bee" and
-"flower" so you can test the export/preview half with no model and no GPU.
-
-1. **Does it load?** After restarting, search the node menu for "Tracks." If the
-   nodes aren't there, check the ComfyUI console for an import error (usually a
-   missing library).
-2. **Export half:** put `sample_tracks.json` in your `input/` folder →
-   **Tracks Load** (path `input/sample_tracks.json`) → **Tracks Export**. Run it
-   for json, then csv, then svg. Open each file — you should see two objects.
-3. **Draw half (debug canvas):** **Tracks Load** → **Tracks Preview** with
-   `images` left unconnected. You'll see the bee and flower outlines on black,
-   moving across 5 frames. Turn off every switch except `draw_contours` to see
-   the outlines alone.
-4. **The real thing:** build the SAM3 chain from §3 on a short clip, send it
-   through **SAM3 Track → Tracks → Tracks Preview** (feeding in the same video).
-   Watch the console for `[EasyTrack] SAM3TrackToTracks -> Tracks(N frames,
-   WxH, K objects)` to confirm the counts match your clip.
-
-Testing in this order means a later failure is easy to locate: if step 2–3 work
-but step 4 doesn't, the problem is in the SAM3 wiring, not in these nodes.
-
----
-
-## 9. The thinking behind the design
-
-This section is the "why," so you can learn from the choices, not just use them.
-
-**Why not reinvent the tracker?** ComfyUI already ships native SAM3 nodes that
-detect and track better than anything we'd hand-write. The honest move was to
-build only the *missing* piece — getting the data out — and lean on the native
-nodes for the hard part. Good engineering is often knowing what *not* to build.
-
-**Why a data type keyed by object → frame?** This is the core design decision.
-ComfyUI's popular "SEGS" type (from the Impact Pack) stores detections
-*per frame with no identity* — it's built for "find things in one image and
-retouch them," and it has no concept of *time* or *which object is which*. A
-tracker needs exactly those two things. So instead of bending SEGS to fit, we
-made a type whose primary axes are **object identity** and **time**. The lesson:
-pick your data structure to match the question you're asking ("where is this
-specific object over time?"), not the tool you happen to have.
-
-**Why use SAM3's video mode?** It remembers objects across frames and gives them
-stable IDs for free. Doing that ourselves (matching objects frame to frame)
-is exactly the wheel SAM3 already invented, so we don't.
-
-**Why store both contour and mask?** They answer different questions — a light
-outline for art tools, and an exact pixel mask for measurement. Forcing one to
-do both jobs would compromise both, so we offer each and let you switch off what
-you don't need.
-
-**Why one consolidated file instead of one-per-frame?** A folder full of
-per-frame files is painful to load and reason about. One file, nested by object
-then frame, keeps a whole clip together and makes lookups trivial.
-
-**Why is the data type independent of SAM3?** The `TRACKS` structure doesn't
-mention SAM3 anywhere — it's just points/boxes/contours over time. That means a
-different detector could fill it in later without changing anything downstream.
-Keeping the data format separate from the tool that produces it is what lets a
-project grow without rewrites.
-
----
-
-## 10. Troubleshooting
-
-- **Nodes don't appear in the menu** → an import failed; read the ComfyUI
-  console (often a missing `pycocotools` or `opencv-python`).
-- **A fix "didn't take"** → you didn't fully restart, or stale bytecode. Delete
-  the folder's `__pycache__` and restart the server.
-- **Preview shapes are offset / wrong size** → your preview image isn't the same
-  size as the tracks. Use the same frames SAM3 saw, or leave `images` empty.
-- **Nothing tracked / empty output** → the word didn't match the object; try a
-  clearer prompt or lower `detection_threshold` on the SAM3 node.
-- **Outline too jagged / file huge** → raise `contour_simplify`. Too blocky →
-  lower it.
-
----
-
-## 11. Notes confirmed against real data
-
-`SAM3_TRACK_DATA` carries `orig_size` (height, width), `n_frames`, a
-`packed_masks` stack shaped `[frames, objects, ...]`, and `scores` — one
-confidence **per object** (e.g. `[1.0, 0.58, 0.55, 0.52]` for four objects).
-Multiple objects are told apart by index; multiple *concepts* in one run aren't
-split by class, so track one concept per run if you want clean per-class labels.
-
-## 12. What could come next
-
-- More export formats (MOT / COCO-video for analysis).
-- A dense point-tracking stage (CoTracker / TAPIR) for sub-object motion.
-- An alpha/transparent preview output for compositing.
