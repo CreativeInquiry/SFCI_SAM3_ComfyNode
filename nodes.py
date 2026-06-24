@@ -65,23 +65,30 @@ class SAM3TrackToTracks:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"track_data": ("SAM3_TRACK_DATA",)},
+            "required": {"track_data": ("SAM3_TRACK_DATA", {"tooltip": "Connect the output of the native SAM3_VideoTrack node here."})},
             "optional": {
-                "label": ("STRING", {"default": ""}),
-                "store_contour": ("BOOLEAN", {"default": True}),
-                "store_mask_rle": ("BOOLEAN", {"default": True}),
-                "contour_simplify": ("FLOAT", {"default": 0.002, "min": 0.0, "max": 0.05, "step": 0.001}),
-                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0}),
+                "label": ("STRING", {"default": "", "tooltip": "Name for the tracked thing (e.g. 'bee'). Blank uses obj0, obj1, ..."}),
+                "store_contour": ("BOOLEAN", {"default": True, "tooltip": "Save the traced outline (polygon) of each object. Good for vector tools."}),
+                "store_mask_rle": ("BOOLEAN", {"default": True, "tooltip": "Save the exact pixel mask (lossless, COCO RLE). Turn OFF for much smaller files if you only need point/box/contour."}),
+                "contour_simplify": ("FLOAT", {"default": 0.002, "min": 0.0, "max": 0.05, "step": 0.001, "tooltip": "Outline detail vs file size. 0 = keep every edge point; higher = fewer points, smoother (rounds off detail)."}),
+                "min_area": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, "display": "slider", "tooltip": "Drop blobs SMALLER than this fraction of the image area. 0 = no minimum. e.g. 0.001 removes specks."}),
+                "max_area": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, "display": "slider", "tooltip": "Drop blobs LARGER than this fraction of the image area. 1 = no maximum. e.g. 0.9 removes whole-frame blobs."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Frames per second, stored in the output for reference."}),
             },
         }
 
     RETURN_TYPES = ("TRACKS",)
     RETURN_NAMES = ("tracks",)
+    OUTPUT_TOOLTIPS = ("Structured tracking data: per object, per frame point/box/contour/area/score.",)
     FUNCTION = "convert"
     CATEGORY = "EasyTrack"
+    DESCRIPTION = ("Turns SAM3's video tracking output into usable data. For every object in "
+                   "every frame it works out the center point, bounding box, contour outline, "
+                   "area, and score, and bundles them into one TRACKS object you can preview "
+                   "or export. This is the bridge that gets data out of SAM3.")
 
     def convert(self, track_data, label="", store_contour=True, store_mask_rle=True,
-                contour_simplify=0.002, fps=24.0):
+                contour_simplify=0.002, min_area=0.0, max_area=1.0, fps=24.0):
         import torch.nn.functional as F
         from comfy.ldm.sam3.tracker import unpack_masks
 
@@ -89,6 +96,7 @@ class SAM3TrackToTracks:
         n_frames = int(track_data.get("n_frames", 0))
         packed = track_data.get("packed_masks", None)
         scores = track_data.get("scores", [])
+        image_area = float(max(H * W, 1))
 
         tracks = Tracks(height=H, width=W, num_frames=n_frames, fps=float(fps))
         if packed is None:
@@ -96,6 +104,7 @@ class SAM3TrackToTracks:
             return (tracks,)
 
         N, N_obj = int(packed.shape[0]), int(packed.shape[1])
+        kept, dropped = 0, 0
         for t in range(N):
             fb = unpack_masks(packed[t:t + 1]).float()
             fm = F.interpolate(fb, size=(H, W), mode="nearest")[0]  # [N_obj,H,W]
@@ -104,6 +113,10 @@ class SAM3TrackToTracks:
                 m = bm[o]
                 area = int(m.sum())
                 if area <= 1:
+                    continue
+                frac = area / image_area          # blob size as fraction of frame
+                if frac < min_area or frac > max_area:
+                    dropped += 1
                     continue
                 bbox = bbox_from_mask(m)
                 if bbox is None:
@@ -119,34 +132,41 @@ class SAM3TrackToTracks:
                 )
                 tracks.add(o, t, det, label=(label or f"obj{o}"),
                            score=_object_score(scores, o))
+                kept += 1
 
-        print(f"[EasyTrack] SAM3TrackToTracks -> {tracks!r}")
+        print(f"[EasyTrack] SAM3TrackToTracks -> {tracks!r} "
+              f"(kept {kept} detections, dropped {dropped} by area filter)")
         return (tracks,)
 
 
-# ---- 2) export: one consolidated file, json | csv | svg ---------------------
+# ---- 3) export: one consolidated file, json | csv | svg ---------------------
 
 class EasyTracksExport:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "tracks": ("TRACKS",),
-                "filename_prefix": ("STRING", {"default": "tracks"}),
-                "format": (["json", "csv", "svg"], {"default": "json"}),
+                "tracks": ("TRACKS", {"tooltip": "The tracking data to save."}),
+                "filename_prefix": ("STRING", {"default": "tracks", "tooltip": "File name (no extension). Saved into ComfyUI's output folder."}),
+                "format": (["json", "csv", "svg"], {"default": "json", "tooltip": "json = full data; csv = spreadsheet rows; svg = vector drawing for art tools."}),
             },
             "optional": {
-                "include_point": ("BOOLEAN", {"default": True}),
-                "include_box": ("BOOLEAN", {"default": True}),
-                "include_contour": ("BOOLEAN", {"default": True}),
+                "include_point": ("BOOLEAN", {"default": True, "tooltip": "Include the center point in the saved file."}),
+                "include_box": ("BOOLEAN", {"default": True, "tooltip": "Include the bounding box in the saved file."}),
+                "include_contour": ("BOOLEAN", {"default": True, "tooltip": "Include the contour outline in the saved file."}),
             },
         }
 
     RETURN_TYPES = ("TRACKS", "STRING")
     RETURN_NAMES = ("tracks", "path")
+    OUTPUT_TOOLTIPS = ("The same tracks, passed through so you can keep chaining.",
+                       "Full path of the file that was written.")
     FUNCTION = "export"
     OUTPUT_NODE = True
     CATEGORY = "EasyTrack"
+    DESCRIPTION = ("Save the tracking data to one consolidated file: json (complete), csv "
+                   "(spreadsheet), or svg (vector outlines/boxes/points for art tools). Use "
+                   "the include_* switches to save only the parts you want.")
 
     def export(self, tracks, filename_prefix, format,
                include_point=True, include_box=True, include_contour=True):
@@ -240,12 +260,15 @@ class EasyTracksExport:
 class EasyTracksLoad:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"path": ("STRING", {"default": "output/tracks.json"})}}
+        return {"required": {"path": ("STRING", {"default": "output/tracks.json", "tooltip": "Path to a tracks .json file saved by Tracks Export (e.g. input/sample_tracks.json)."})}}
 
     RETURN_TYPES = ("TRACKS",)
     RETURN_NAMES = ("tracks",)
+    OUTPUT_TOOLTIPS = ("The loaded tracking data.",)
     FUNCTION = "load"
     CATEGORY = "EasyTrack"
+    DESCRIPTION = ("Read a saved tracks.json back into a TRACKS object, so you can preview or "
+                   "re-export without re-running slow SAM3.")
 
     @classmethod
     def IS_CHANGED(cls, path):
@@ -259,29 +282,33 @@ class EasyTracksLoad:
             return (Tracks.from_dict(json.load(f)),)
 
 
-# ---- 3) preview: point + box + contour --------------------------------------
+# ---- 4) preview: point + box + contour --------------------------------------
 
 class EasyTracksPreview:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "tracks": ("TRACKS",),
-                "draw_boxes": ("BOOLEAN", {"default": True}),
-                "draw_contours": ("BOOLEAN", {"default": True}),
-                "draw_points": ("BOOLEAN", {"default": True}),
-                "draw_ids": ("BOOLEAN", {"default": True}),
+                "tracks": ("TRACKS", {"tooltip": "The tracking data to draw."}),
+                "draw_boxes": ("BOOLEAN", {"default": True, "tooltip": "Draw the bounding box rectangle."}),
+                "draw_contours": ("BOOLEAN", {"default": True, "tooltip": "Draw the traced outline (the real object shape)."}),
+                "draw_points": ("BOOLEAN", {"default": True, "tooltip": "Draw the center dot."}),
+                "draw_ids": ("BOOLEAN", {"default": True, "tooltip": "Draw each object's id and label."}),
             },
             "optional": {
                 # leave unconnected for a black debug canvas sized to the tracks
-                "images": ("IMAGE",),
+                "images": ("IMAGE", {"tooltip": "The original video frames. Leave unconnected for a black debug canvas at the tracks' own size."}),
             },
         }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("overlay",)
+    OUTPUT_TOOLTIPS = ("Frames with the chosen point/box/contour/id drawn on them.",)
     FUNCTION = "render"
     CATEGORY = "EasyTrack"
+    DESCRIPTION = ("Draw the tracking data (point, box, contour, id) onto the frames so you can "
+                   "see if it's correct. Leave 'images' unconnected to draw on a black debug "
+                   "canvas instead of the footage. The four switches let you show any combination.")
 
     def render(self, tracks, draw_boxes, draw_contours, draw_points, draw_ids, images=None):
         import cv2
