@@ -28,7 +28,7 @@ video and a word ("bee"), and it finds the bee in every frame and even
 remembers that the bee in frame 50 is the *same* bee as in frame 1. That
 "same-bee-over-time" idea is called **tracking**, and SAM3 does it for you.
 
-<img src="./bee-mov.gif" alt="bees" width="300">
+<img src="assets/bee-mov.gif" alt="bees" width="300">
 
 But there's a catch: when SAM3 finishes, it keeps its findings in a form meant
 for *making pictures* (cutting the bee out, masking, compositing). It does
