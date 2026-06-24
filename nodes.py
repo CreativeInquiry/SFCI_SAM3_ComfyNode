@@ -176,7 +176,7 @@ class EasyTracksExport:
             "required": {
                 "tracks": ("TRACKS", {"tooltip": "The tracking data to save."}),
                 "filename_prefix": ("STRING", {"default": "tracks", "tooltip": "File name (no extension). Saved into ComfyUI's output folder."}),
-                "format": (["json", "csv", "svg"], {"default": "json", "tooltip": "json = full data; csv = spreadsheet rows; svg = vector drawing for art tools."}),
+                "format": (["json", "csv", "svg", "jsx"], {"default": "json", "tooltip": "json = full data; csv = spreadsheet rows; svg = vector drawing for art tools; jsx = After Effects script (nulls keyframed from the points)."}),
             },
             "optional": {
                 "include_point": ("BOOLEAN", {"default": True, "tooltip": "Include the center point in the saved file."}),
@@ -206,6 +206,8 @@ class EasyTracksExport:
             self._write_csv(tracks, path, sel)
         elif format == "svg":
             self._write_svg(tracks, path, sel)
+        elif format == "jsx":
+            self._write_jsx(tracks, path, sel)
         print(f"[EasyTrack] exported {format} (point={include_point}, "
               f"box={include_box}, contour={include_contour}) -> {path}")
         return (tracks, path)
@@ -283,6 +285,56 @@ class EasyTracksExport:
         lines.append('</svg>')
         with open(path, "w") as f:
             f.write("\n".join(lines))
+
+    @staticmethod
+    def _write_jsx(tracks, path, sel):
+        # After Effects ExtendScript: build a comp with one null per object,
+        # Position keyframed from the centroid point. AE uses top-left origin
+        # with y down, same as image pixels, so coords map directly.
+        inc_pt, inc_box, inc_ct = sel
+        W = int(tracks.width or 1920)
+        H = int(tracks.height or 1080)
+        fps = float(tracks.fps or 24.0)
+        n = max(int(tracks.num_frames), 1)
+        dur = round(n / fps, 4)
+
+        L = []
+        L.append("// EasyTrack -> After Effects (ExtendScript .jsx)")
+        L.append("// In After Effects: File > Scripts > Run Script File... and pick this file.")
+        L.append("// Creates a comp with one null per tracked object, Position keyframed")
+        L.append("// from each object's centre point. Box/contour are not imported here.")
+        L.append("(function () {")
+        L.append("  app.beginUndoGroup('EasyTrack import');")
+        L.append(f"  var comp = app.project.items.addComp('EasyTrack', {W}, {H}, 1.0, {dur}, {fps});")
+        L.append("  function addNull(name, times, xs, ys) {")
+        L.append("    var lyr = comp.layers.addNull();")
+        L.append("    lyr.name = name;")
+        L.append("    var pos = lyr.property('ADBE Transform Group').property('ADBE Position');")
+        L.append("    for (var i = 0; i < times.length; i++) { pos.setValueAtTime(times[i], [xs[i], ys[i]]); }")
+        L.append("  }")
+
+        for oid in tracks.ids():
+            obj = tracks.objects[oid]
+            times, xs, ys = [], [], []
+            for fidx in sorted(obj.frames):
+                det = obj.frames[fidx]
+                if det.point:
+                    px, py = det.point
+                else:
+                    x1, y1, x2, y2 = det.bbox
+                    px, py = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                times.append(round(fidx / fps, 5))
+                xs.append(round(float(px), 2))
+                ys.append(round(float(py), 2))
+            if not times:
+                continue
+            name = (f"{oid} {obj.label}").strip()
+            L.append(f"  addNull({json.dumps(name)}, {times}, {xs}, {ys});")
+
+        L.append("  app.endUndoGroup();")
+        L.append("})();")
+        with open(path, "w") as f:
+            f.write("\n".join(L))
 
 
 class EasyTracksLoad:
