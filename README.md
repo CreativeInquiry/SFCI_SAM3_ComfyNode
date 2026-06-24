@@ -7,7 +7,7 @@ you can actually use, from SAM 3.1.**
 
 > "According to all known laws of aviation, there is no way a bee should be able to fly. Its wings are too small to get its fat little body off the ground. The bee, of course, flies anyway because bees don't care what humans think is impossible." --Bee Movie, 2007
 
-<img src="./assets/bee1.png" alt="bee hero">
+<img src="assets/bee1.png" alt="bee hero" width="300">
 
 
 This is a small set of ComfyUI nodes for students and artists who want to take
@@ -98,7 +98,7 @@ It bundles all of that into one tidy `TRACKS` object.
 **Settings:** `label` (name the thing, e.g. "bee"), `store_contour`,
 `store_mask_rle`, `contour_simplify` (see §6), `fps`.
 
-<img src="./track-node.png" alt="node1" width="300">
+<img src="assets/track-node.png" alt="node1" width="300">
 
 
 ### Tracks Preview  *("did it work?")*
@@ -111,7 +111,7 @@ shapes on each frame.
 optional** — leave it unconnected and you get a black "debug canvas" at the
 right size with just the shapes on it, handy for checking the geometry alone.
 
-<img src="./preview-node.png" alt="node2" width="300">
+<img src="assets/preview-node.png" alt="node2" width="300">
 
 ### Tracks Export  *(save it)*
 **What it does:** writes everything to **one** file you can open elsewhere.
@@ -122,7 +122,7 @@ Illustrator, After Effects, Photoshop).
 only the parts you want. It also outputs the file `path` so you know where it
 landed.
 
-<img src="./export-node.png" alt="node3" width="300">
+<img src="assets/export-node.png" alt="node3" width="300">
 
 ### Tracks Load  *(open a saved file)*
 **What it does:** reads a saved `tracks.json` back into a `TRACKS` object, so
@@ -233,8 +233,8 @@ re-creating the mask, compositing). Don't need that? Set `store_mask_rle` to
 **off** and the field disappears, making your files much smaller.
  
 
-<img src="./bee-outline-many.png" alt="lots" width="300">
-<img src="./bee-outline.png" alt="outline" width="300">
+<img src=".assets/bee-outline-many.png" alt="lots" width="300">
+<img src="assets/bee-outline.png" alt="outline" width="300">
 
 ---
 
