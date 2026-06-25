@@ -3,7 +3,7 @@
 *By Claire Vlases*
 
 **Import a video, follow the objects in it, and get their positions out as data
-you can actually use, from SAM 3.1.**
+you can actually use.**
 
 > "According to all known laws of aviation, there is no way a bee should be able to fly. Its wings are too small to get its fat little body off the ground. The bee, of course, flies anyway because bees don't care what humans think is impossible." --Bee Movie, 2007
 
@@ -61,74 +61,84 @@ EasyTrack is the bridge that takes SAM3's findings and writes them down as usabl
 
 ## 3. How the pieces connect
 
-```
-   your video ────────────────────────────────────────────────┐
-        │                                                     │
-        ▼                                                     │
-  (the native SAM3 chain)                                     │
-   Load Checkpoint(sam3.1) ─model─┐                           │
-   CLIP Text Encode("bee") ─text──┐                           │
-                                  ▼                           │
-                          SAM3 VideoTrack                     │
-                                  │  (SAM3_TRACK_DATA)        │
-                                  ▼                           │
-   ┌──────────────── EasyTrack starts here ──────────────┐    │
-   │     SAM3 Track → Tracks   ── TRACKS ──┬── Tracks Export (json/csv/svg)
-   │                                       └── Tracks Preview ◄── (same video)
-   └─────────────────────────────────────────────────────┘
-```
 
+```
+  your video ────────────────────────────────────────────────┐
+       │                                                     │
+       ▼                                                     │
+  a tracker / detector                                       │
+   SAM3 VideoTrack ─(SAM3_TRACK_DATA)─┐                      │
+   or YOLO/any boxes ─(JSON)──────────┤                      │
+       │                              ▼                      │
+       │                  PART 1: make a TRACKS              │
+       │             SAM3 Track → Tracks  /  Boxes → Tracks  │
+       │                              │ (TRACKS)             │
+       │           ┌──────────────────┼─────────────────┐    │
+       │  (optional point tracking)   │                 │    │
+       │   Tracks → CoTracker Points  │                 │    │
+       │            │                 │                 │    │
+       │      [ CoTracker node ]◄─────┼─ (same video) ──┼────┘
+       │            │ (tracking_results)                │
+       │   CoTracker Results → Tracks │                 │
+       │            └────────► TRACKS ◄─────────────────┘
+       │                              │
+       ▼                  PART 2: use a TRACKS
+   Tracks Preview ◄──(same video)   Tracks Export (json/csv/svg/jsx)
+```
 
 
 ---
 
 ## 4. The nodes, one at a time
 
-### SAM3 Track → Tracks  *(the heart of it)*
-**What it does:** turns SAM3's output into your data.
-**How it works:** SAM3 hands over a bundle with the video size, the number of
-frames, a stack of compressed masks (one per object per frame), and a
-confidence score per object. This node walks through every frame and every
-object, and for each one it works out:
-- the **box** (smallest rectangle around the mask),
-- the **point** (the mask's center),
-- the **contour** (the mask's outline, traced with OpenCV),
-- the **area** (how many pixels), and the **score**.
-It bundles all of that into one tidy `TRACKS` object.
-**Settings:** `label` (name the thing, e.g. "bee"), `store_contour`,
-`store_mask_rle`, `contour_simplify` (see §6), `fps`.
+### Part 1: Create a `TRACKS` datatype
+ 
+**SAM3 Track → Tracks**  *(the heart of it)*
+Turns SAM3's output into your data. SAM3 hands over the video size, frame count,
+a stack of compressed masks (one per object per frame), and a confidence per
+object. This node goes through every frame and object and works out the **box**, the
+**point** (mask center), the **contour** (outline, via OpenCV), the **area**,
+and the **score**, and bundles them into one `TRACKS`.
+*Settings:* `label`, `store_contour`, `store_mask_rle`, `contour_simplify`,
+`contour_holes`, `min_area` / `max_area`, `fps`.
 
-<img src="assets/track-node.png" alt="node1" width="300">
-
-
-### Tracks Preview  *("did it work?")*
-**What it does:** draws the point, box, contour, and ID onto the frames so you
-can *see* if the tracking is right.
-**How it works:** for each object it picks a stable color and draws the chosen
-shapes on each frame.
-**Settings:** four on/off switches (`draw_boxes`, `draw_contours`,
-`draw_points`, `draw_ids`) so you can show any combination. **`images` is
-optional** — leave it unconnected and you get a black "debug canvas" at the
-right size with just the shapes on it, handy for checking the geometry alone.
+ <img src="assets/track-node.png" alt="node1" width="300">
+ 
+**Boxes → Tracks**  *(YOLO / any box detector)*
+Turns boxes from any detector into the same `TRACKS`, from a JSON input.
+Because raw detections have no identity across frames, this node includes a small
+**IoU linker** that stitches per-frame boxes into tracks, or uses the IDs your
+detector already provides (e.g. YOLO `track` mode).
+ 
+### Point tracking (optional)
+ 
+**Tracks → CoTracker Points** seeds `x,y` query points from each object's mask,
+formatted for the external CoTracker node's `tracking_points` input.
+**CoTracker Results → Tracks** takes that node's `tracking_results` back and
+writes the trajectories into each object (`track_points` / `track_visible`).
+ 
+### Part 2: Using the `TRACKS` datatype
+ 
+**Tracks Preview**  *(your eyes — "did it work?")*
+Draws the point, box, contour, ids, and point-trajectories onto the frames so you
+can *see* if it's right. Switches: `draw_boxes`, `draw_contours`, `draw_points`,
+`draw_tracks`, `draw_ids`. **`images` is optional**. Leave it unconnected for a
+black "debug canvas" at the right size with just the shapes.
 
 <img src="assets/preview-node.png" alt="node2" width="300">
-
-### Tracks Export  *(save it)*
-**What it does:** writes everything to **one** file you can open elsewhere.
-**Formats:** `json` (complete data), `csv` (a spreadsheet, one row per object
-per frame), `svg` (a vector drawing — outlines, boxes, points — openable in
-Illustrator, After Effects, Photoshop).
-**Settings:** `include_point` / `include_box` / `include_contour` let you save
-only the parts you want. It also outputs the file `path` so you know where it
-landed.
+ 
+**Tracks Export**  *(save it)*
+Writes everything to **one** file: `json` (complete), `csv` (a spreadsheet row
+per object per frame), `svg` (a vector drawing for art tools), or `jsx` (an After
+Effects script). `include_point` / `include_box` / `include_contour` save only
+the parts you want; it also outputs the file `path`.
 
 <img src="assets/export-node.png" alt="node3" width="300">
-
-### Tracks Load  *(open a saved file)*
-**What it does:** reads a saved `tracks.json` back into a `TRACKS` object, so
-you can preview or re-export without re-running slow SAM3.
-
-
+ 
+**Tracks Load**  *(open a saved file)*
+Reads a saved `tracks.json` back into a `TRACKS`, so you can preview or re-export
+without re-running slow SAM3.
+ 
 ---
 
 ## 5. The data you get out
