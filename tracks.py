@@ -95,8 +95,8 @@ class FrameDet:
     score: float = 1.0
     visible: bool = True
     mask_rle: Optional[dict] = None     # optional full-fidelity mask
-    track_points: Optional[list] = None      # reserved: dense point-tracking
-    track_visible: Optional[list] = None
+    track_points: Optional[list] = None      # dense point-tracking, from points.py
+    track_visible: Optional[list] = None      # per-point visibility for the above
 
 
 @dataclass

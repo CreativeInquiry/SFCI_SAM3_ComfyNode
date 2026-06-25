@@ -1,8 +1,8 @@
 """
 points.py — EasyTrack point-tracking bridge (uses the external CoTracker node).
 
-The community node
-`s9roll7/comfyui_cotracker_node` already runs cotracker for us: feed it points as "x,y" per
+We do NOT run CoTracker ourselves. The community node
+`s9roll7/comfyui_cotracker_node` already runs it: feed it points as "x,y" per
 line (or a grid), and it returns `tracking_results` — a list of per-point
 trajectories, each `[{"x":..,"y":..}, ...]` over frames. These two nodes are the
 bridge between that node and our TRACKS data:
@@ -10,9 +10,17 @@ bridge between that node and our TRACKS data:
     TracksToPoints          : TRACKS -> "x,y" per line   (seed the CoTracker node)
     TrackingResultsToTracks : tracking_results (+TRACKS) -> TRACKS with track_points
 
+Why a geometric merge, not index mapping: the CoTracker node's `format_results`
+runs `select_points`, which drops/reorders points by min_distance, max_points,
+and confidence. So its output points do NOT line up with the points we sent in.
+We instead assign each returned trajectory to the object whose first-frame mask
+(or bbox) contains the trajectory's starting point — robust to any filtering.
+
 Graph:  SAM3/Boxes -> Tracks -> TracksToPoints -> [CoTracker node] ->
         TrackingResultsToTracks (also fed the same Tracks) -> Export / Preview
 
+Tip: in the CoTracker node, lower `min_distance` if you want dense points per
+object (its default 60px collapses nearby seeds to one).
 """
 
 from __future__ import annotations

@@ -1,23 +1,30 @@
 """
-nodes.py — EasyTrack nodes on top of ComfyUI's native SAM3 nodes.
+nodes.py — all the EasyTrack ComfyUI nodes. Two jobs:
 
-    SAM3TrackToTracks : SAM3_TRACK_DATA -> TRACKS  (point + box + contour + mask)
-    EasyTracksExport  : TRACKS -> json | csv | svg | jsx  (one consolidated file)
+  PART 1 - MAKE A TRACKS (adapters: turn a detector's output into our data)
+    SAM3TrackToTracks : SAM3_TRACK_DATA -> TRACKS   (point+box+contour+mask)
+    BoxesToTracks     : boxes (JSON)    -> TRACKS   (YOLO / any box detector)
+
+  PART 2 - USE A TRACKS (do something with the data)
+    EasyTracksExport  : TRACKS -> json | csv | svg | jsx  (one file)
     EasyTracksLoad    : tracks.json -> TRACKS
-    EasyTracksPreview : TRACKS + IMAGE -> IMAGE
+    EasyTracksPreview : TRACKS (+IMAGE) -> IMAGE          (draw it to check)
+
+(Point tracking lives in points.py. The TRACKS data type lives in tracks.py.)
 """
 
 from __future__ import annotations
 
 import os
 import json
+import math
 import colorsys
 
 import numpy as np
 import torch
 
 from .tracks import (
-    Tracks, FrameDet,
+    Tracks, TrackObject, FrameDet,
     mask_to_rle, rle_to_mask,
     bbox_from_mask, centroid_from_mask, mask_to_contours,
 )
@@ -88,7 +95,11 @@ def _output_dir():
         return d
 
 
-# ---- 1) adapter: SAM3_TRACK_DATA -> TRACKS (all geometry) -------------------
+# =============================================================================
+# PART 1 - MAKE A TRACKS  (adapters: detector output -> TRACKS)
+# =============================================================================
+
+# ---- SAM3 -> TRACKS (all geometry) ------------------------------------------
 
 class SAM3TrackToTracks:
     @classmethod
@@ -169,7 +180,180 @@ class SAM3TrackToTracks:
         return (tracks,)
 
 
-# ---- 2) export: one consolidated file, json | csv | svg | jsx ---------------------
+# ---- Boxes / YOLO -> TRACKS -------------------------------------------------
+# (identity for per-frame detections via a small IoU linker)
+
+# ---- IoU linker: per-frame boxes -> stable track ids ------------------------
+
+def iou(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    ua = max(0.0, (a[2] - a[0]) * (a[3] - a[1]))
+    ub = max(0.0, (b[2] - b[0]) * (b[3] - b[1]))
+    union = ua + ub - inter
+    return inter / union if union > 0 else 0.0
+
+
+class IoULinker:
+    """Greedy IoU association (SORT-lite, no Kalman). Stable enough for slow
+    objects; fast erratic motion may need a real tracker."""
+
+    def __init__(self, iou_thresh=0.3, max_age=10):
+        self.iou_thresh = iou_thresh
+        self.max_age = max_age
+        self.next_id = 0
+        self.tracks = {}            # id -> {"bbox": [...], "last": frame_idx}
+
+    def update(self, frame_idx, boxes):
+        """boxes: list of [x1,y1,x2,y2]. Returns a list of ids aligned to boxes."""
+        for tid in list(self.tracks):
+            if frame_idx - self.tracks[tid]["last"] > self.max_age:
+                del self.tracks[tid]
+
+        pairs = []
+        for di, b in enumerate(boxes):
+            for tid, tr in self.tracks.items():
+                v = iou(b, tr["bbox"])
+                if v >= self.iou_thresh:
+                    pairs.append((v, di, tid))
+        pairs.sort(reverse=True)
+
+        det_to_tid, used = {}, set()
+        for _, di, tid in pairs:
+            if di in det_to_tid or tid in used:
+                continue
+            det_to_tid[di] = tid
+            used.add(tid)
+
+        ids = []
+        for di, b in enumerate(boxes):
+            tid = det_to_tid.get(di)
+            if tid is None:
+                tid = self.next_id
+                self.next_id += 1
+            self.tracks[tid] = {"bbox": b, "last": frame_idx}
+            ids.append(tid)
+        return ids
+
+
+# ---- box parsing ------------------------------------------------------------
+
+def _norm_box(item):
+    """Accept [x1,y1,x2,y2], [x1,y1,x2,y2,score], or
+    {bbox/box:[...], score, label, id}. Returns dict or None."""
+    if isinstance(item, dict):
+        b = item.get("bbox") or item.get("box")
+        if not b or len(b) < 4:
+            return None
+        return {"bbox": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
+                "score": float(item.get("score", item.get("conf", 1.0))),
+                "label": item.get("label", item.get("cls")),
+                "id": item.get("id")}
+    if isinstance(item, (list, tuple)) and len(item) >= 4:
+        return {"bbox": [float(item[0]), float(item[1]), float(item[2]), float(item[3])],
+                "score": float(item[4]) if len(item) > 4 else 1.0,
+                "label": None, "id": None}
+    return None
+
+
+def parse_boxes(s):
+    """JSON -> (frames, meta). frames = list (per frame) of lists of box dicts.
+    Accepts a bare list-of-frames, or {"frames":[...], "width":w, "height":h}."""
+    data = json.loads(s)
+    meta = {}
+    if isinstance(data, dict):
+        meta = {"width": data.get("width"), "height": data.get("height")}
+        data = data.get("frames", [])
+    frames = []
+    for fr in data:
+        dets = [d for d in (_norm_box(x) for x in fr) if d is not None]
+        frames.append(dets)
+    return frames, meta
+
+
+# ---- Boxes -> TRACKS --------------------------------------------------------
+
+class BoxesToTracks:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "boxes": ("STRING", {"default": "", "multiline": True,
+                                     "tooltip": "JSON: a list of frames, each a list of boxes. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "Optional. Used only to read width/height/frame-count."}),
+                "width": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame width if no images. 0 = infer from the boxes."}),
+                "height": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame height if no images. 0 = infer from the boxes."}),
+                "link": ("BOOLEAN", {"default": True, "tooltip": "Assign stable IDs across frames with an IoU linker. Ignored if your boxes already carry 'id' (e.g. YOLO track mode)."}),
+                "iou_thresh": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How much two boxes must overlap to count as the same object."}),
+                "max_age": ("INT", {"default": 10, "min": 0, "max": 300, "tooltip": "Frames an object may vanish for before its ID is retired."}),
+                "label": ("STRING", {"default": "object", "tooltip": "Default label when a box doesn't carry one."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0}),
+            },
+        }
+
+    RETURN_TYPES = ("TRACKS",)
+    RETURN_NAMES = ("tracks",)
+    FUNCTION = "convert"
+    CATEGORY = "EasyTrack"
+    DESCRIPTION = ("Turn boxes from any detector (YOLO, etc.) into TRACKS. Adds stable IDs "
+                   "across frames with an IoU linker, or uses the IDs your detector provides.")
+
+    def convert(self, boxes, images=None, width=0, height=0, link=True,
+                iou_thresh=0.3, max_age=10, label="object", fps=24.0):
+        frames, meta = parse_boxes(boxes) if boxes.strip() else ([], {})
+
+        # figure out frame size
+        H = int(height or meta.get("height") or 0)
+        W = int(width or meta.get("width") or 0)
+        n_frames = len(frames)
+        if images is not None:
+            n_frames = max(n_frames, int(images.shape[0]))
+            H = H or int(images.shape[1])
+            W = W or int(images.shape[2])
+        if (not H or not W) and frames:                 # infer from box extents
+            maxx = max((d["bbox"][2] for fr in frames for d in fr), default=1)
+            maxy = max((d["bbox"][3] for fr in frames for d in fr), default=1)
+            W = W or int(math.ceil(maxx))
+            H = H or int(math.ceil(maxy))
+
+        tracks = Tracks(height=int(H or 1), width=int(W or 1),
+                        num_frames=max(n_frames, 1), fps=float(fps))
+        linker = IoULinker(iou_thresh, max_age) if link else None
+
+        for fi, dets in enumerate(frames):
+            if not dets:
+                continue
+            have_ids = all(d["id"] is not None for d in dets)
+            if have_ids:
+                ids = [int(d["id"]) for d in dets]
+            elif linker is not None:
+                ids = linker.update(fi, [d["bbox"] for d in dets])
+            else:
+                ids = list(range(len(dets)))     # per-frame ids (no linking)
+
+            for d, oid in zip(dets, ids):
+                x1, y1, x2, y2 = d["bbox"]
+                tracks.add(int(oid), fi, FrameDet(
+                    bbox=[x1, y1, x2, y2],
+                    point=[round((x1 + x2) / 2, 2), round((y1 + y2) / 2, 2)],
+                    area=int(max(x2 - x1, 0) * max(y2 - y1, 0)),
+                    score=d["score"],
+                    visible=True,
+                ), label=(d["label"] or label), score=d["score"])
+
+        print(f"[EasyTrack] BoxesToTracks -> {tracks!r}")
+        return (tracks,)
+
+
+# =============================================================================
+# PART 2 - USE A TRACKS  (export / load / preview)
+# =============================================================================
+
+# ---- export: one consolidated file, json | csv | svg | jsx ------------------
 
 class EasyTracksExport:
     @classmethod
@@ -195,8 +379,8 @@ class EasyTracksExport:
     OUTPUT_NODE = True
     CATEGORY = "EasyTrack"
     DESCRIPTION = ("Save the tracking data to one consolidated file: json (complete), csv "
-                   "(spreadsheet), or svg (vector outlines/boxes/points for art tools). Use "
-                   "the include_* switches to save only the parts you want.")
+                   "(spreadsheet), svg (vector outlines/boxes/points for art tools), or jsx "
+                   "(After Effects nulls keyframed from the points). include_* picks the parts.")
 
     def export(self, tracks, filename_prefix, format,
                include_point=True, include_box=True, include_contour=True):
@@ -338,7 +522,6 @@ class EasyTracksExport:
         with open(path, "w") as f:
             f.write("\n".join(L))
 
-# ---- 3) load: load in an existing json file ---------------------
 
 class EasyTracksLoad:
     @classmethod
@@ -376,6 +559,7 @@ class EasyTracksPreview:
                 "draw_boxes": ("BOOLEAN", {"default": True, "tooltip": "Draw the bounding box rectangle."}),
                 "draw_contours": ("BOOLEAN", {"default": True, "tooltip": "Draw the traced outline (the real object shape)."}),
                 "draw_points": ("BOOLEAN", {"default": True, "tooltip": "Draw the center dot."}),
+                "draw_tracks": ("BOOLEAN", {"default": True, "tooltip": "Draw CoTracker point trajectories (track_points): a dot per tracked point, dim where the point is hidden."}),
                 "draw_ids": ("BOOLEAN", {"default": True, "tooltip": "Draw each object's id and label."}),
             },
             "optional": {
@@ -393,7 +577,7 @@ class EasyTracksPreview:
                    "see if it's correct. Leave 'images' unconnected to draw on a black debug "
                    "canvas instead of the footage. The four switches let you show any combination.")
 
-    def render(self, tracks, draw_boxes, draw_contours, draw_points, draw_ids, images=None):
+    def render(self, tracks, draw_boxes, draw_contours, draw_points, draw_tracks, draw_ids, images=None):
         import cv2
         if images is not None:
             out = [f.copy() for f in comfy_to_frames(images)]
@@ -423,6 +607,11 @@ class EasyTracksPreview:
                     cv2.rectangle(fr, (x1, y1), (x2, y2), color, 1)
                 if draw_points and det.point:
                     cv2.circle(fr, (int(det.point[0]), int(det.point[1])), 3, color, -1)
+                if draw_tracks and det.track_points:
+                    vis = det.track_visible or [True] * len(det.track_points)
+                    for (px, py), v in zip(det.track_points, vis):
+                        c = color if v else tuple(int(ch * 0.35) for ch in color)
+                        cv2.circle(fr, (int(px), int(py)), 2, c, -1)
                 if draw_ids:
                     tag = f"{oid}" + (f" {obj.label}" if obj.label else "")
                     x1, y1 = int(det.bbox[0]), int(det.bbox[1])
