@@ -29,6 +29,9 @@ from .tracks import (
     bbox_from_mask, centroid_from_mask, mask_to_contours,
 )
 
+DETECT_CATEGORY = "EasyVision/1 Detect"
+TRACKS_CATEGORY = "EasyVision/3 Tracks"
+
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -122,7 +125,7 @@ class SAM3TrackToTracks:
     RETURN_NAMES = ("tracks",)
     OUTPUT_TOOLTIPS = ("Structured tracking data: per object, per frame point/box/contour/area/score.",)
     FUNCTION = "convert"
-    CATEGORY = "EasyTrack"
+    CATEGORY = DETECT_CATEGORY
     DESCRIPTION = ("Turns SAM3's video tracking output into usable data. For every object in "
                    "every frame it works out the center point, bounding box, contour outline, "
                    "area, and score, and bundles them into one TRACKS object you can preview "
@@ -298,7 +301,7 @@ class BoxesToTracks:
     RETURN_TYPES = ("TRACKS",)
     RETURN_NAMES = ("tracks",)
     FUNCTION = "convert"
-    CATEGORY = "EasyTrack"
+    CATEGORY = DETECT_CATEGORY
     DESCRIPTION = ("Turn boxes from any detector (YOLO, etc.) into TRACKS. Adds stable IDs "
                    "across frames with an IoU linker, or uses the IDs your detector provides.")
 
@@ -323,6 +326,7 @@ class BoxesToTracks:
         tracks = Tracks(height=int(H or 1), width=int(W or 1),
                         num_frames=max(n_frames, 1), fps=float(fps))
         linker = IoULinker(iou_thresh, max_age) if link else None
+        next_unlinked_id = 0
 
         for fi, dets in enumerate(frames):
             if not dets:
@@ -333,7 +337,11 @@ class BoxesToTracks:
             elif linker is not None:
                 ids = linker.update(fi, [d["bbox"] for d in dets])
             else:
-                ids = list(range(len(dets)))     # per-frame ids (no linking)
+                # When linking is off and no detector ids are provided, each
+                # box should become its own short track instead of reusing
+                # 0..N on every frame and accidentally merging unrelated boxes.
+                ids = list(range(next_unlinked_id, next_unlinked_id + len(dets)))
+                next_unlinked_id += len(dets)
 
             for d, oid in zip(dets, ids):
                 x1, y1, x2, y2 = d["bbox"]
@@ -377,7 +385,7 @@ class EasyTracksExport:
                        "Full path of the file that was written.")
     FUNCTION = "export"
     OUTPUT_NODE = True
-    CATEGORY = "EasyTrack"
+    CATEGORY = TRACKS_CATEGORY
     DESCRIPTION = ("Save the tracking data to one consolidated file: json (complete), csv "
                    "(spreadsheet), svg (vector outlines/boxes/points for art tools), or jsx "
                    "(After Effects nulls keyframed from the points). include_* picks the parts.")
@@ -532,7 +540,7 @@ class EasyTracksLoad:
     RETURN_NAMES = ("tracks",)
     OUTPUT_TOOLTIPS = ("The loaded tracking data.",)
     FUNCTION = "load"
-    CATEGORY = "EasyTrack"
+    CATEGORY = TRACKS_CATEGORY
     DESCRIPTION = ("Read a saved tracks.json back into a TRACKS object, so you can preview or "
                    "re-export without re-running slow SAM3.")
 
@@ -572,7 +580,7 @@ class EasyTracksPreview:
     RETURN_NAMES = ("overlay",)
     OUTPUT_TOOLTIPS = ("Frames with the chosen point/box/contour/id drawn on them.",)
     FUNCTION = "render"
-    CATEGORY = "EasyTrack"
+    CATEGORY = TRACKS_CATEGORY
     DESCRIPTION = ("Draw the tracking data (point, box, contour, id) onto the frames so you can "
                    "see if it's correct. Leave 'images' unconnected to draw on a black debug "
                    "canvas instead of the footage. The four switches let you show any combination.")

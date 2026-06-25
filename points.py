@@ -13,8 +13,9 @@ bridge between that node and our TRACKS data:
 Why a geometric merge, not index mapping: the CoTracker node's `format_results`
 runs `select_points`, which drops/reorders points by min_distance, max_points,
 and confidence. So its output points do NOT line up with the points we sent in.
-We instead assign each returned trajectory to the object whose first-frame mask
-(or bbox) contains the trajectory's starting point — robust to any filtering.
+We instead assign each returned trajectory to the object whose mask (or bbox)
+near the trajectory's first visible frame contains its starting point — robust
+to any filtering and less brittle when objects enter later.
 
 Graph:  SAM3/Boxes -> Tracks -> TracksToPoints -> [CoTracker node] ->
         TrackingResultsToTracks (also fed the same Tracks) -> Export / Preview
@@ -31,6 +32,8 @@ import math
 import numpy as np
 
 from .tracks import Tracks, TrackObject, FrameDet, rle_to_mask
+
+TRACK_CATEGORY = "EasyVision/2 Track"
 
 
 # ---- seeding helpers (TRACKS / mask / grid -> points) -----------------------
@@ -84,7 +87,7 @@ class TracksToPoints:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("tracking_points",)
     FUNCTION = "seed"
-    CATEGORY = "EasyTrack"
+    CATEGORY = TRACK_CATEGORY
     DESCRIPTION = ("Seed query points from each object's mask, formatted for the CoTracker node "
                    "(s9roll7/comfyui_cotracker_node) tracking_points input.")
 
@@ -142,11 +145,13 @@ def _visible(p):
     return not (int(p[0]) == HIDDEN and int(p[1]) == HIDDEN)
 
 
-def _first_visible(traj):
-    for p in traj:
+def _first_visible_with_index(traj):
+    for idx, p in enumerate(traj):
         if _visible(p):
-            return p
-    return traj[0] if traj else [0, 0]
+            return idx, p
+    if traj:
+        return 0, traj[0]
+    return 0, [0, 0]
 
 
 def _det_contains(det, x, y):
@@ -155,17 +160,26 @@ def _det_contains(det, x, y):
         if m is not None and 0 <= int(y) < m.shape[0] and 0 <= int(x) < m.shape[1]:
             return bool(m[int(y), int(x)] > 0)
     x1, y1, x2, y2 = det.bbox
-    return x1 <= x <= x2 and y1 <= y <= y2
+    return x1 <= x < x2 and y1 <= y < y2
 
 
-def assign_to_object(tracks, x, y):
-    """Object whose first-frame shape contains (x,y); else nearest by centroid; else None."""
+def _object_det_near_frame(obj, frame_hint):
+    if not obj.frames:
+        return None
+    if frame_hint in obj.frames:
+        return obj.frames[frame_hint]
+    nearest = min(obj.frames, key=lambda fi: abs(fi - frame_hint))
+    return obj.frames[nearest]
+
+
+def assign_to_object(tracks, x, y, frame_hint=0):
+    """Object whose shape near frame_hint contains (x,y); else nearest by centroid."""
     best, best_d = None, None
     for oid in tracks.ids():
         obj = tracks.objects[oid]
-        if not obj.frames:
+        det = _object_det_near_frame(obj, frame_hint)
+        if det is None:
             continue
-        det = obj.frames[min(obj.frames)]
         if _det_contains(det, x, y):
             return oid
         if det.point is not None:
@@ -182,7 +196,8 @@ class TrackingResultsToTracks:
     Fold the CoTracker node's tracking_results into TRACKS (track_points /
     track_visible). With a TRACKS input, each trajectory is assigned to an object
     by where it starts (geometric, robust to the node's point filtering). Without
-    one, all trajectories go into a single 'points' object.
+    one, all trajectories go into a single 'points' object. By default this
+    augments existing EasyDetect frames only; synthetic frames are optional.
     """
 
     @classmethod
@@ -197,17 +212,22 @@ class TrackingResultsToTracks:
                 "images": ("IMAGE", {"tooltip": "Optional. Only used for frame size when there's no tracks input."}),
                 "label": ("STRING", {"default": "points"}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0}),
+                "fill_missing_frames": ("BOOLEAN", {"default": False,
+                                                    "tooltip": "Recommended OFF. OFF = only attach point tracks to frames that already exist in the EasyDetect result. ON = create synthetic per-frame detections from the tracked points when needed."}),
             },
         }
 
     RETURN_TYPES = ("TRACKS",)
     RETURN_NAMES = ("tracks",)
     FUNCTION = "merge"
-    CATEGORY = "EasyTrack"
+    CATEGORY = TRACK_CATEGORY
     DESCRIPTION = ("Turn the CoTracker node's tracking_results into TRACKS point trajectories, "
-                   "assigning each trajectory to the object it starts inside.")
+                   "assigning each trajectory to the object it starts inside. Recommended "
+                   "workflow: keep fill_missing_frames OFF so EasyTrack augments EasyDetect "
+                   "instead of replacing it.")
 
-    def merge(self, tracking_results, tracks=None, images=None, label="points", fps=24.0):
+    def merge(self, tracking_results, tracks=None, images=None, label="points", fps=24.0,
+              fill_missing_frames=False):
         trajs = parse_trajectories(tracking_results)
         if not trajs:
             print("[EasyTrack] TrackingResultsToTracks: no trajectories parsed")
@@ -216,11 +236,12 @@ class TrackingResultsToTracks:
         T = max(len(t) for t in trajs)
 
         if tracks is not None and tracks.objects:
-            base = tracks
+            base = tracks.copy()
             groups = {oid: [] for oid in base.ids()}
             for traj in trajs:
-                sx, sy = _first_visible(traj)
-                oid = assign_to_object(base, sx, sy)
+                start_frame, start_point = _first_visible_with_index(traj)
+                sx, sy = start_point
+                oid = assign_to_object(base, sx, sy, frame_hint=start_frame)
                 if oid is None:
                     oid = base.ids()[0]
                 groups[oid].append(traj)
@@ -249,6 +270,8 @@ class TrackingResultsToTracks:
                         vis.append(_visible(p))
                 det = obj.frames.get(t)
                 if det is None:
+                    if not fill_missing_frames:
+                        continue
                     xs = [p[0] for p, v in zip(pts, vis) if v] or [p[0] for p in pts]
                     ys = [p[1] for p, v in zip(pts, vis) if v] or [p[1] for p in pts]
                     bbox = ([int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1]
@@ -260,5 +283,5 @@ class TrackingResultsToTracks:
 
         base.num_frames = max(base.num_frames, T)
         print(f"[EasyTrack] TrackingResultsToTracks -> {len(trajs)} trajectories, "
-              f"{T} frames, {len(groups)} object(s)")
+              f"{T} frames, {len(groups)} object(s), fill_missing_frames={fill_missing_frames}")
         return (base,)

@@ -1,9 +1,9 @@
-"""ComfyUI-EasyTrack — make tracking data, add point tracking, export it.
+"""ComfyUI-EasyTrack — detect objects, add tracking, export the data.
 
 Three files:
   tracks.py  — the TRACKS data type that flows between nodes (the shared noun)
-  nodes.py   — the nodes: PART 1 make a TRACKS (SAM3, Boxes), PART 2 use it (export/load/preview)
-  points.py  — optional point-tracking bridge to the external CoTracker node
+  nodes.py   — EasyDetect adapters + Tracks preview/export/load nodes
+  points.py  — EasyTrack bridge to the external CoTracker node
 """
 
 from .nodes import (
@@ -32,10 +32,10 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SAM3TrackToTracks": "SAM3 Track \u2192 Tracks",
-    "BoxesToTracks": "Boxes \u2192 Tracks (YOLO/any)",
-    "TracksToPoints": "Tracks \u2192 CoTracker Points",
-    "TrackingResultsToTracks": "CoTracker Results \u2192 Tracks",
+    "SAM3TrackToTracks": "EasyDetect SAM3 \u2192 Tracks",
+    "BoxesToTracks": "EasyDetect Boxes \u2192 Tracks",
+    "TracksToPoints": "EasyTrack Tracks \u2192 CoTracker Points",
+    "TrackingResultsToTracks": "EasyTrack CoTracker Results \u2192 Tracks",
     "EasyTracksExport": "Tracks Export (json/csv/svg/jsx)",
     "EasyTracksLoad": "Tracks Load (JSON)",
     "EasyTracksPreview": "Tracks Preview",

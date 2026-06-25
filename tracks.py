@@ -10,6 +10,7 @@ SAM3 mask: a centroid POINT, a BBOX, CONTOUR polygon(s), area, score, and
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
+from copy import deepcopy
 from typing import Optional
 
 import numpy as np
@@ -143,6 +144,9 @@ class Tracks:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def copy(self) -> "Tracks":
+        return Tracks.from_dict(deepcopy(self.to_dict()))
 
     @classmethod
     def from_dict(cls, d: dict) -> "Tracks":
