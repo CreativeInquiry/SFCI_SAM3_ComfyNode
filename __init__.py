@@ -1,9 +1,17 @@
-"""ComfyUI-EasyTrack — detect objects, add tracking, export the data.
+"""ComfyUI-EasyTrack — turn SAM3 / YOLO / CoTracker into one TRACKS type, then preview or export.
 
-Three files:
-  tracks.py  — the TRACKS data type that flows between nodes (the shared noun)
-  nodes.py   — EasyDetect adapters + Tracks preview/export/load nodes
-  points.py  — EasyTrack bridge to the external CoTracker node
+THREE ADAPTERS (each makes a TRACKS):
+    SAM3 -> Tracks        objects with masks / contours / boxes
+    YOLO Boxes -> Tracks  objects from boxes (with IoU linking)
+    CoTracker -> Tracks   point trajectories from the CoTracker node
+
+USE A TRACKS:
+    Tracks Preview   draw it to check
+    Tracks Export    save json / csv / svg / jsx
+    Tracks Load      read a saved json back
+
+Files: tracks.py (the TRACKS type), nodes.py (SAM3 + YOLO adapters, preview/export/load),
+points.py (the CoTracker adapter).
 """
 
 from .nodes import (
@@ -13,32 +21,26 @@ from .nodes import (
     EasyTracksLoad,
     EasyTracksPreview,
 )
-from .points import (
-    TracksToPoints,
-    TrackingResultsToTracks,
-)
+from .points import TrackingResultsToTracks
 
 NODE_CLASS_MAPPINGS = {
-    # PART 1 — make a TRACKS
+    # --- three input adapters ---
     "SAM3TrackToTracks": SAM3TrackToTracks,
     "BoxesToTracks": BoxesToTracks,
-    # point tracking
-    "TracksToPoints": TracksToPoints,
     "TrackingResultsToTracks": TrackingResultsToTracks,
-    # PART 2 — use a TRACKS
+    # --- use a TRACKS ---
+    "EasyTracksPreview": EasyTracksPreview,
     "EasyTracksExport": EasyTracksExport,
     "EasyTracksLoad": EasyTracksLoad,
-    "EasyTracksPreview": EasyTracksPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SAM3TrackToTracks": "EasyDetect SAM3 \u2192 Tracks",
-    "BoxesToTracks": "EasyDetect Boxes \u2192 Tracks",
-    "TracksToPoints": "EasyTrack Tracks \u2192 CoTracker Points",
-    "TrackingResultsToTracks": "EasyTrack CoTracker Results \u2192 Tracks",
+    "SAM3TrackToTracks": "SAM3 \u2192 Tracks",
+    "BoxesToTracks": "YOLO Boxes \u2192 Tracks",
+    "TrackingResultsToTracks": "CoTracker \u2192 Tracks",
+    "EasyTracksPreview": "Tracks Preview",
     "EasyTracksExport": "Tracks Export (json/csv/svg/jsx)",
     "EasyTracksLoad": "Tracks Load (JSON)",
-    "EasyTracksPreview": "Tracks Preview",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

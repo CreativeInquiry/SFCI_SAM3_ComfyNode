@@ -1,110 +1,32 @@
 """
-points.py — EasyTrack point-tracking bridge (uses the external CoTracker node).
+points.py — the CoTracker adapter.
 
-We do NOT run CoTracker ourselves. The community node
-`s9roll7/comfyui_cotracker_node` already runs it: feed it points as "x,y" per
-line (or a grid), and it returns `tracking_results` — a list of per-point
-trajectories, each `[{"x":..,"y":..}, ...]` over frames. These two nodes are the
-bridge between that node and our TRACKS data:
+CoTracker is the third input adapter, alongside SAM3 -> Tracks and
+YOLO Boxes -> Tracks. We do NOT run CoTracker ourselves; the community node
+`s9roll7/comfyui_cotracker_node` runs it and seeds its own points (a grid, or a
+tracking_mask). Our one job is to turn its `tracking_results` into a TRACKS.
 
-    TracksToPoints          : TRACKS -> "x,y" per line   (seed the CoTracker node)
-    TrackingResultsToTracks : tracking_results (+TRACKS) -> TRACKS with track_points
+    TrackingResultsToTracks : tracking_results -> TRACKS   ("CoTracker -> Tracks")
+        Works on its own (all trajectories become one 'points' object), or, given
+        a TRACKS, assigns each trajectory to the object it starts inside.
 
-Why a geometric merge, not index mapping: the CoTracker node's `format_results`
+Graph:
+    [CoTracker node] -> CoTracker -> Tracks -> Preview / Export
+
+Why the merge is geometric, not by index: the CoTracker node's `format_results`
 runs `select_points`, which drops/reorders points by min_distance, max_points,
-and confidence. So its output points do NOT line up with the points we sent in.
-We instead assign each returned trajectory to the object whose mask (or bbox)
-near the trajectory's first visible frame contains its starting point — robust
-to any filtering and less brittle when objects enter later.
-
-Graph:  SAM3/Boxes -> Tracks -> TracksToPoints -> [CoTracker node] ->
-        TrackingResultsToTracks (also fed the same Tracks) -> Export / Preview
-
-Tip: in the CoTracker node, lower `min_distance` if you want dense points per
-object (its default 60px collapses nearby seeds to one).
+and confidence. So its output points do NOT line up with anything. We assign each
+returned trajectory to the object whose mask (or bbox) near the trajectory's
+first visible frame contains its starting point.
 """
 
 from __future__ import annotations
 
 import json
-import math
-
-import numpy as np
 
 from .tracks import Tracks, TrackObject, FrameDet, rle_to_mask
 
 TRACK_CATEGORY = "EasyVision/2 Track"
-
-
-# ---- seeding helpers (TRACKS / mask / grid -> points) -----------------------
-
-def seed_grid_in_mask(mask, bbox, n_target):
-    """Grid of up to ~n_target points inside an object (mask-clipped, bbox fallback)."""
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    w, h = max(x2 - x1, 1), max(y2 - y1, 1)
-    cols = max(int(round(math.sqrt(max(n_target, 1) * w / h))), 1)
-    rows = max(int(round(max(n_target, 1) / cols)), 1)
-    pts = []
-    for r in range(rows):
-        for c in range(cols):
-            xi = int(x1 + (c + 0.5) * w / cols)
-            yi = int(y1 + (r + 0.5) * h / rows)
-            if mask is not None:
-                if 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and mask[yi, xi] > 0:
-                    pts.append([xi, yi])
-            else:
-                pts.append([xi, yi])
-    if not pts:
-        pts = [[int((x1 + x2) / 2), int((y1 + y2) / 2)]]
-    return pts[:max(n_target, 1)]
-
-
-def uniform_grid(H, W, g):
-    xs = np.linspace(W * 0.05, W * 0.95, max(g, 1))
-    ys = np.linspace(H * 0.05, H * 0.95, max(g, 1))
-    return [[int(x), int(y)] for y in ys for x in xs]
-
-
-# ---- 1) seeder: TRACKS -> tracking_points string ----------------------------
-
-class TracksToPoints:
-    """
-    Turn a TRACKS object into the 'x,y' per-line string the CoTracker node wants.
-    Seeds a grid of points inside each object's mask on the frame it first
-    appears. Wire the output into the CoTracker node's `tracking_points`.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {"tracks": ("TRACKS",)},
-            "optional": {
-                "points_per_object": ("INT", {"default": 9, "min": 1, "max": 400, "step": 1,
-                                              "tooltip": "How many points to seed inside each object."}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("tracking_points",)
-    FUNCTION = "seed"
-    CATEGORY = TRACK_CATEGORY
-    DESCRIPTION = ("Seed query points from each object's mask, formatted for the CoTracker node "
-                   "(s9roll7/comfyui_cotracker_node) tracking_points input.")
-
-    def seed(self, tracks, points_per_object=9):
-        lines = []
-        for oid in tracks.ids():
-            obj = tracks.objects[oid]
-            if not obj.frames:
-                continue
-            det = obj.frames[min(obj.frames)]
-            mask = rle_to_mask(det.mask_rle) if det.mask_rle is not None else None
-            for x, y in seed_grid_in_mask(mask, det.bbox, points_per_object):
-                lines.append(f"{int(x)},{int(y)}")
-        out = "\n".join(lines)
-        print(f"[EasyTrack] TracksToPoints -> {len(lines)} seed points "
-              f"for {len(tracks.ids())} objects")
-        return (out,)
 
 
 # ---- trajectory parsing + geometric assignment ------------------------------
@@ -221,10 +143,9 @@ class TrackingResultsToTracks:
     RETURN_NAMES = ("tracks",)
     FUNCTION = "merge"
     CATEGORY = TRACK_CATEGORY
-    DESCRIPTION = ("Turn the CoTracker node's tracking_results into TRACKS point trajectories, "
-                   "assigning each trajectory to the object it starts inside. Recommended "
-                   "workflow: keep fill_missing_frames OFF so EasyTrack augments EasyDetect "
-                   "instead of replacing it.")
+    DESCRIPTION = ("CoTracker -> Tracks. Turns the CoTracker node's tracking_results into a "
+                   "TRACKS. Use it on its own (every trajectory becomes one 'points' object) or "
+                   "feed it a TRACKS to assign each trajectory to the object it starts inside.")
 
     def merge(self, tracking_results, tracks=None, images=None, label="points", fps=24.0,
               fill_missing_frames=False):
@@ -237,6 +158,7 @@ class TrackingResultsToTracks:
 
         if tracks is not None and tracks.objects:
             base = tracks.copy()
+            building_fresh = False
             groups = {oid: [] for oid in base.ids()}
             for traj in trajs:
                 start_frame, start_point = _first_visible_with_index(traj)
@@ -256,6 +178,13 @@ class TrackingResultsToTracks:
             base = Tracks(height=H, width=W, num_frames=max(n, T), fps=float(fps))
             base.objects[0] = TrackObject(object_id=0, label=label, score=1.0)
             groups = {0: trajs}
+            building_fresh = True
+
+        # When building from scratch (no input TRACKS), there are no detection
+        # frames to augment, so we must create them — otherwise the node would
+        # output an empty TRACKS. fill_missing_frames only gates the case where
+        # we're adding points to an existing detection result.
+        fill = fill_missing_frames or building_fresh
 
         for oid, tlist in groups.items():
             if not tlist:
@@ -270,7 +199,7 @@ class TrackingResultsToTracks:
                         vis.append(_visible(p))
                 det = obj.frames.get(t)
                 if det is None:
-                    if not fill_missing_frames:
+                    if not fill:
                         continue
                     xs = [p[0] for p, v in zip(pts, vis) if v] or [p[0] for p in pts]
                     ys = [p[1] for p, v in zip(pts, vis) if v] or [p[1] for p in pts]

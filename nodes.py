@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import ast
 import colorsys
 
 import numpy as np
@@ -252,41 +253,105 @@ class IoULinker:
 
 # ---- box parsing ------------------------------------------------------------
 
-def _norm_box(item):
-    """Accept [x1,y1,x2,y2], [x1,y1,x2,y2,score], or
-    {bbox/box:[...], score, label, id}. Returns dict or None."""
+def _parse_tensor_repr(s):
+    """
+    Parse a Python repr of a list of PyTorch tensors (one tensor per frame),
+    e.g. what a YOLO node dumps:
+        [tensor([[cx,cy,w,h], ...], device='cuda:0'), tensor([], ..., size=(0,4)), ...]
+    Each tensor becomes one frame's list of boxes; empty tensors become [].
+    Robust to device=/dtype=/size=(...) extras via balanced-paren scanning.
+    """
+    frames, i = [], 0
+    while True:
+        j = s.find("tensor(", i)
+        if j < 0:
+            break
+        start = j + len("tensor(") - 1          # index of the '('
+        depth, m = 0, start
+        while m < len(s):
+            if s[m] == '(':
+                depth += 1
+            elif s[m] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            m += 1
+        inside = s[start + 1:m]                  # text between tensor( ... )
+        boxes, b0 = [], inside.find('[')
+        if b0 >= 0:
+            d, n = 0, b0
+            while n < len(inside):
+                if inside[n] == '[':
+                    d += 1
+                elif inside[n] == ']':
+                    d -= 1
+                    if d == 0:
+                        break
+                n += 1
+            matrix = inside[b0:n + 1].strip()
+            boxes = [] if matrix == '[]' else ast.literal_eval(matrix)
+        frames.append(boxes)
+        i = m + 1
+    return frames
+
+
+def _parse_boxes_text(s):
+    """Boxes text -> python object. Accepts JSON, or a PyTorch tensor-repr dump."""
+    s = (s or "").strip()
+    if not s:
+        return []
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    if "tensor(" in s:
+        return _parse_tensor_repr(s)
+    return json.loads(s)            # not JSON, not tensors -> raise a clear error
+
+
+def _convert_box(b, box_format):
+    """Turn a 4-number box into xyxy corners, given its source format."""
+    a, c, w, h = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+    if box_format == "cxcywh":      # YOLO center format: center_x, center_y, w, h
+        return [a - w / 2.0, c - h / 2.0, a + w / 2.0, c + h / 2.0]
+    if box_format == "xywh":        # top-left x, y, w, h
+        return [a, c, a + w, c + h]
+    return [a, c, w, h]             # xyxy: already corners
+
+
+def _norm_box(item, box_format="xyxy"):
+    """Accept [x1,y1,x2,y2(,score)] or {bbox/box:[...], score, label, id}.
+    The 4 box numbers are interpreted per box_format and stored as xyxy."""
     if isinstance(item, dict):
         b = item.get("bbox") or item.get("box")
         if not b or len(b) < 4:
             return None
-        return {"bbox": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
+        return {"bbox": _convert_box(b, box_format),
                 "score": float(item.get("score", item.get("conf", 1.0))),
                 "label": item.get("label", item.get("cls")),
                 "id": item.get("id")}
     if isinstance(item, (list, tuple)) and len(item) >= 4:
-        return {"bbox": [float(item[0]), float(item[1]), float(item[2]), float(item[3])],
+        return {"bbox": _convert_box(item, box_format),
                 "score": float(item[4]) if len(item) > 4 else 1.0,
                 "label": None, "id": None}
     return None
 
 
 def parse_boxes(s):
-    """JSON -> (frames, meta). frames = list (per frame) of lists of box dicts.
-    Accepts a bare list-of-frames, or {"frames":[...], "width":w, "height":h}."""
-    data = json.loads(s)
-    return split_box_payload(data)
+    """JSON/tensor-repr -> (frames, meta)."""
+    return split_box_payload(_parse_boxes_text(s))
 
 
 def load_box_payload(boxes="", boxes_path=""):
-    """Load boxes JSON from a string or a file path."""
+    """Load boxes (JSON or tensor-repr) from a string or a file path."""
     if boxes_path and boxes_path.strip():
         with open(boxes_path) as f:
-            data = json.load(f)
+            text = f.read()
     elif boxes and boxes.strip():
-        data = json.loads(boxes)
+        text = boxes
     else:
-        data = []
-    return split_box_payload(data)
+        return [], {}
+    return split_box_payload(_parse_boxes_text(text))
 
 
 def split_box_payload(data):
@@ -298,8 +363,8 @@ def split_box_payload(data):
     return data or [], meta
 
 
-def normalize_box_frame(frame_data, min_score=0.0, max_detections_per_frame=0):
-    dets = [d for d in (_norm_box(x) for x in (frame_data or [])) if d is not None]
+def normalize_box_frame(frame_data, min_score=0.0, max_detections_per_frame=0, box_format="xyxy"):
+    dets = [d for d in (_norm_box(x, box_format) for x in (frame_data or [])) if d is not None]
     if min_score > 0.0:
         dets = [d for d in dets if float(d.get("score", 1.0)) >= min_score]
     if max_detections_per_frame and len(dets) > max_detections_per_frame:
@@ -334,7 +399,8 @@ class BoxesToTracks:
                                      "tooltip": "JSON: a list of frames, each a list of boxes. Leave blank if you use boxes_path instead. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
             },
             "optional": {
-                "boxes_path": ("STRING", {"default": "", "tooltip": "Recommended for large YOLO exports. Path to a .json file on disk, so ComfyUI does not need to keep a giant detection string in the graph."}),
+                "box_format": (["xyxy", "cxcywh", "xywh"], {"default": "xyxy", "tooltip": "How to read each box's 4 numbers. xyxy = corners [x1,y1,x2,y2]. cxcywh = YOLO center [cx,cy,w,h]. xywh = top-left [x,y,w,h]. Most raw YOLO tensor dumps are cxcywh."}),
+                "boxes_path": ("STRING", {"default": "", "tooltip": "Recommended for large YOLO exports. Path to a .json OR a saved tensor-dump .txt on disk, so ComfyUI does not need to keep a giant detection string in the graph."}),
                 "images": ("IMAGE", {"tooltip": "Optional. Used only to read width/height/frame-count."}),
                 "width": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame width if no images. 0 = infer from the boxes."}),
                 "height": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame height if no images. 0 = infer from the boxes."}),
@@ -358,7 +424,7 @@ class BoxesToTracks:
                    "across frames with an IoU linker, or uses the IDs your detector provides. "
                    "For large YOLO runs, prefer boxes_path plus score / frame filters.")
 
-    def convert(self, boxes, boxes_path="", images=None, width=0, height=0,
+    def convert(self, boxes, box_format="xyxy", boxes_path="", images=None, width=0, height=0,
                 min_score=0.25, max_detections_per_frame=50, frame_stride=1,
                 max_frames=0, link=True, iou_thresh=0.3, max_age=10,
                 label="object", fps=24.0):
@@ -376,7 +442,7 @@ class BoxesToTracks:
         if (not H or not W) and raw_frames:             # infer from filtered box extents
             maxx, maxy = 1.0, 1.0
             for fi in used_indices:
-                dets = normalize_box_frame(raw_frames[fi], min_score, max_detections_per_frame)
+                dets = normalize_box_frame(raw_frames[fi], min_score, max_detections_per_frame, box_format)
                 for d in dets:
                     maxx = max(maxx, d["bbox"][2])
                     maxy = max(maxy, d["bbox"][3])
@@ -390,7 +456,7 @@ class BoxesToTracks:
         kept_total = 0
 
         for fi in used_indices:
-            dets = normalize_box_frame(raw_frames[fi], min_score, max_detections_per_frame)
+            dets = normalize_box_frame(raw_frames[fi], min_score, max_detections_per_frame, box_format)
             if not dets:
                 continue
             have_ids = all(d["id"] is not None for d in dets)
