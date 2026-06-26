@@ -117,6 +117,9 @@ class SAM3TrackToTracks:
                 "contour_holes": ("BOOLEAN", {"default": False, "tooltip": "Include hole boundaries as contours. OFF = outer outline only (a donut gives one contour). ON = also trace holes (a donut gives two: outer ring + inner hole)."}),
                 "min_area": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, "display": "slider", "tooltip": "Remove blobs SMALLER than this fraction of the image area. 0 = no minimum. e.g. 0.001 removes specks (incl. stray bits inside an object's box)."}),
                 "max_area": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, "display": "slider", "tooltip": "Remove blobs LARGER than this fraction of the image area. 1 = no maximum. e.g. 0.9 removes pathological whole-frame blobs."}),
+                "frame_stride": ("INT", {"default": 1, "min": 1, "max": 120, "tooltip": "Use every Nth frame from SAM3. 2 = every other frame. Helpful for long videos."}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 1000000, "tooltip": "Optional cap on how many frames to convert. 0 = use all selected frames."}),
+                "max_objects": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Optional cap on how many SAM3 objects to convert. 0 = use all objects."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Frames per second, stored in the output for reference."}),
             },
         }
@@ -133,7 +136,8 @@ class SAM3TrackToTracks:
 
     def convert(self, track_data, label="", store_contour=True, store_mask_rle=True,
                 contour_simplify=0.002, contour_holes=False,
-                min_area=0.0, max_area=1.0, fps=24.0):
+                min_area=0.0, max_area=1.0, frame_stride=1, max_frames=0,
+                max_objects=0, fps=24.0):
         import torch.nn.functional as F
         from comfy.ldm.sam3.tracker import unpack_masks
 
@@ -149,13 +153,14 @@ class SAM3TrackToTracks:
             return (tracks,)
 
         N, N_obj = int(packed.shape[0]), int(packed.shape[1])
+        frame_indices = selected_frame_indices(N, frame_stride, max_frames)
+        object_indices = selected_object_indices(N_obj, max_objects)
         kept, dropped = 0, 0
-        for t in range(N):
+        for t in frame_indices:
             fb = unpack_masks(packed[t:t + 1]).float()
             fm = F.interpolate(fb, size=(H, W), mode="nearest")[0]  # [N_obj,H,W]
-            bm = (fm > 0.5).cpu().numpy().astype(np.uint8)
-            for o in range(N_obj):
-                m = bm[o]
+            for o in object_indices:
+                m = (fm[o] > 0.5).to(torch.uint8).cpu().numpy()
                 # drop blobs (incl. specks inside the mask) outside the size range
                 m = filter_blobs_by_area(m, min_area, max_area, image_area)
                 area = int(m.sum())
@@ -177,9 +182,13 @@ class SAM3TrackToTracks:
                 tracks.add(o, t, det, label=(label or f"obj{o}"),
                            score=_object_score(scores, o))
                 kept += 1
+            del fm
+            del fb
 
         print(f"[EasyTrack] SAM3TrackToTracks -> {tracks!r} "
-              f"(kept {kept} detections, dropped {dropped} by area filter)")
+              f"(frames read {len(frame_indices)}/{N}, objects read {len(object_indices)}/{N_obj}, "
+              f"kept {kept} detections, dropped {dropped} by area filter, "
+              f"frame_stride={frame_stride})")
         return (tracks,)
 
 
@@ -265,15 +274,53 @@ def parse_boxes(s):
     """JSON -> (frames, meta). frames = list (per frame) of lists of box dicts.
     Accepts a bare list-of-frames, or {"frames":[...], "width":w, "height":h}."""
     data = json.loads(s)
+    return split_box_payload(data)
+
+
+def load_box_payload(boxes="", boxes_path=""):
+    """Load boxes JSON from a string or a file path."""
+    if boxes_path and boxes_path.strip():
+        with open(boxes_path) as f:
+            data = json.load(f)
+    elif boxes and boxes.strip():
+        data = json.loads(boxes)
+    else:
+        data = []
+    return split_box_payload(data)
+
+
+def split_box_payload(data):
+    """Python object -> (frames, meta)."""
     meta = {}
     if isinstance(data, dict):
         meta = {"width": data.get("width"), "height": data.get("height")}
         data = data.get("frames", [])
-    frames = []
-    for fr in data:
-        dets = [d for d in (_norm_box(x) for x in fr) if d is not None]
-        frames.append(dets)
-    return frames, meta
+    return data or [], meta
+
+
+def normalize_box_frame(frame_data, min_score=0.0, max_detections_per_frame=0):
+    dets = [d for d in (_norm_box(x) for x in (frame_data or [])) if d is not None]
+    if min_score > 0.0:
+        dets = [d for d in dets if float(d.get("score", 1.0)) >= min_score]
+    if max_detections_per_frame and len(dets) > max_detections_per_frame:
+        dets.sort(key=lambda d: float(d.get("score", 1.0)), reverse=True)
+        dets = dets[:max_detections_per_frame]
+    return dets
+
+
+def selected_frame_indices(n_frames, frame_stride=1, max_frames=0):
+    stride = max(int(frame_stride), 1)
+    chosen = list(range(0, int(n_frames), stride))
+    if max_frames and max_frames > 0:
+        chosen = chosen[:int(max_frames)]
+    return chosen
+
+
+def selected_object_indices(n_objects, max_objects=0):
+    chosen = list(range(int(n_objects)))
+    if max_objects and max_objects > 0:
+        chosen = chosen[:int(max_objects)]
+    return chosen
 
 
 # ---- Boxes -> TRACKS --------------------------------------------------------
@@ -284,12 +331,17 @@ class BoxesToTracks:
         return {
             "required": {
                 "boxes": ("STRING", {"default": "", "multiline": True,
-                                     "tooltip": "JSON: a list of frames, each a list of boxes. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
+                                     "tooltip": "JSON: a list of frames, each a list of boxes. Leave blank if you use boxes_path instead. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
             },
             "optional": {
+                "boxes_path": ("STRING", {"default": "", "tooltip": "Recommended for large YOLO exports. Path to a .json file on disk, so ComfyUI does not need to keep a giant detection string in the graph."}),
                 "images": ("IMAGE", {"tooltip": "Optional. Used only to read width/height/frame-count."}),
                 "width": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame width if no images. 0 = infer from the boxes."}),
                 "height": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame height if no images. 0 = infer from the boxes."}),
+                "min_score": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Drop low-confidence detections before building tracks. Higher values reduce memory and false positives."}),
+                "max_detections_per_frame": ("INT", {"default": 50, "min": 0, "max": 10000, "tooltip": "Keep only the top N detections per frame by score. 0 = keep everything. Lower this if YOLO is producing too many boxes."}),
+                "frame_stride": ("INT", {"default": 1, "min": 1, "max": 120, "tooltip": "Use every Nth frame from the detector output. 2 = every other frame. Helpful for long videos."}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 1000000, "tooltip": "Optional cap on how many detector frames to read. 0 = use all selected frames."}),
                 "link": ("BOOLEAN", {"default": True, "tooltip": "Assign stable IDs across frames with an IoU linker. Ignored if your boxes already carry 'id' (e.g. YOLO track mode)."}),
                 "iou_thresh": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How much two boxes must overlap to count as the same object."}),
                 "max_age": ("INT", {"default": 10, "min": 0, "max": 300, "tooltip": "Frames an object may vanish for before its ID is retired."}),
@@ -303,23 +355,31 @@ class BoxesToTracks:
     FUNCTION = "convert"
     CATEGORY = DETECT_CATEGORY
     DESCRIPTION = ("Turn boxes from any detector (YOLO, etc.) into TRACKS. Adds stable IDs "
-                   "across frames with an IoU linker, or uses the IDs your detector provides.")
+                   "across frames with an IoU linker, or uses the IDs your detector provides. "
+                   "For large YOLO runs, prefer boxes_path plus score / frame filters.")
 
-    def convert(self, boxes, images=None, width=0, height=0, link=True,
-                iou_thresh=0.3, max_age=10, label="object", fps=24.0):
-        frames, meta = parse_boxes(boxes) if boxes.strip() else ([], {})
+    def convert(self, boxes, boxes_path="", images=None, width=0, height=0,
+                min_score=0.25, max_detections_per_frame=50, frame_stride=1,
+                max_frames=0, link=True, iou_thresh=0.3, max_age=10,
+                label="object", fps=24.0):
+        raw_frames, meta = load_box_payload(boxes, boxes_path)
+        used_indices = selected_frame_indices(len(raw_frames), frame_stride, max_frames)
 
         # figure out frame size
         H = int(height or meta.get("height") or 0)
         W = int(width or meta.get("width") or 0)
-        n_frames = len(frames)
+        n_frames = len(raw_frames)
         if images is not None:
             n_frames = max(n_frames, int(images.shape[0]))
             H = H or int(images.shape[1])
             W = W or int(images.shape[2])
-        if (not H or not W) and frames:                 # infer from box extents
-            maxx = max((d["bbox"][2] for fr in frames for d in fr), default=1)
-            maxy = max((d["bbox"][3] for fr in frames for d in fr), default=1)
+        if (not H or not W) and raw_frames:             # infer from filtered box extents
+            maxx, maxy = 1.0, 1.0
+            for fi in used_indices:
+                dets = normalize_box_frame(raw_frames[fi], min_score, max_detections_per_frame)
+                for d in dets:
+                    maxx = max(maxx, d["bbox"][2])
+                    maxy = max(maxy, d["bbox"][3])
             W = W or int(math.ceil(maxx))
             H = H or int(math.ceil(maxy))
 
@@ -327,8 +387,10 @@ class BoxesToTracks:
                         num_frames=max(n_frames, 1), fps=float(fps))
         linker = IoULinker(iou_thresh, max_age) if link else None
         next_unlinked_id = 0
+        kept_total = 0
 
-        for fi, dets in enumerate(frames):
+        for fi in used_indices:
+            dets = normalize_box_frame(raw_frames[fi], min_score, max_detections_per_frame)
             if not dets:
                 continue
             have_ids = all(d["id"] is not None for d in dets)
@@ -352,8 +414,12 @@ class BoxesToTracks:
                     score=d["score"],
                     visible=True,
                 ), label=(d["label"] or label), score=d["score"])
+                kept_total += 1
 
-        print(f"[EasyTrack] BoxesToTracks -> {tracks!r}")
+        print(f"[EasyTrack] BoxesToTracks -> {tracks!r} "
+              f"(frames read {len(used_indices)}/{len(raw_frames)}, kept {kept_total} boxes, "
+              f"min_score={min_score}, max_per_frame={max_detections_per_frame}, "
+              f"frame_stride={frame_stride})")
         return (tracks,)
 
 

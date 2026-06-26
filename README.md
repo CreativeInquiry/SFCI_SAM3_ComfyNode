@@ -154,7 +154,16 @@ Then it bundles all of that into one `TRACKS` object.
 
 Settings:
 `label`, `store_contour`, `store_mask_rle`, `contour_simplify`,
-`contour_holes`, `min_area`, `max_area`, `fps`
+`contour_holes`, `min_area`, `max_area`, `frame_stride`, `max_frames`,
+`max_objects`, `fps`
+
+If a long SAM3 run is taking too long or hitting memory limits, the safest fixes are:
+
+- turn `store_mask_rle` off if you do not need exact masks
+- turn `store_contour` off if you only need box + point
+- raise `frame_stride` for long videos
+- lower `max_frames`
+- lower `max_objects` if SAM3 found too many things
 
 <img src="assets/track-node.png" alt="node1" width="300">
 
@@ -169,6 +178,13 @@ box in frame 11.
 
 This path is great when you want a simpler "find the bee here" workflow, even
 if you do not have a full object mask.
+
+If a long YOLO run is taking too long or eating memory, the safest fixes are:
+
+- use `boxes_path` instead of pasting one giant JSON string
+- raise `min_score` so weak detections get dropped
+- lower `max_detections_per_frame`
+- raise `frame_stride` for long videos
 
 ### Part 2: EasyTrack adds point motion (optional)
 
