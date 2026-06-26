@@ -34,6 +34,18 @@ DETECT_CATEGORY = "EasyVision/1 Detect"
 TRACKS_CATEGORY = "EasyVision/3 Tracks"
 
 
+class AnyType(str):
+    """A type string that compares equal to everything, so an input socket of
+    this type accepts a wire from any output (we don't know what a given YOLO
+    node names its box output, so we accept anything and validate in code)."""
+
+    def __ne__(self, other):
+        return False
+
+
+any_type = AnyType("*")
+
+
 # ---- helpers ----------------------------------------------------------------
 
 def comfy_to_frames(images):
@@ -363,6 +375,53 @@ def split_box_payload(data):
     return data or [], meta
 
 
+def _to_python(x):
+    """Recursively turn torch tensors / numpy arrays into plain python lists."""
+    if hasattr(x, "detach"):                 # torch tensor
+        try:
+            return x.detach().cpu().tolist()
+        except Exception:
+            pass
+    if hasattr(x, "tolist") and not isinstance(x, (list, tuple)):   # numpy array
+        try:
+            return x.tolist()
+        except Exception:
+            pass
+    if isinstance(x, (list, tuple)):
+        return [_to_python(e) for e in x]
+    return x
+
+
+def _as_frames(data):
+    """Decide whether `data` is already a list of frames or a single frame.
+
+    A YOLO node may hand us a list of per-frame box tensors (-> already frames)
+    or a single [N,4] tensor for one frame (-> wrap it as one frame). Empty
+    frames (no detections) are kept so frame numbering stays aligned.
+    """
+    if not isinstance(data, list):
+        return []
+    sample = next((e for e in data if isinstance(e, list) and len(e) > 0), None)
+    if sample is None:
+        return data                          # all empty -> treat as frames of empties
+    if isinstance(sample[0], list):
+        return data                          # element is a list of boxes -> frames
+    return [data]                            # element is one box -> single frame
+
+
+def _coerce_boxes_payload(obj):
+    """A live 'boxes' value (wired from a detector) -> (frames, meta).
+    Accepts a string (JSON / tensor-repr), a dict, torch tensors, numpy arrays,
+    a list of per-frame tensors, or a single [N,4] tensor."""
+    if obj is None:
+        return [], {}
+    if isinstance(obj, str):
+        return split_box_payload(_parse_boxes_text(obj))
+    if isinstance(obj, dict):
+        return split_box_payload(obj)
+    return _as_frames(_to_python(obj)), {}
+
+
 def normalize_box_frame(frame_data, min_score=0.0, max_detections_per_frame=0, box_format="xyxy"):
     dets = [d for d in (_norm_box(x, box_format) for x in (frame_data or [])) if d is not None]
     if min_score > 0.0:
@@ -394,13 +453,12 @@ class BoxesToTracks:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "boxes": ("STRING", {"default": "", "multiline": True,
-                                     "tooltip": "JSON: a list of frames, each a list of boxes. Leave blank if you use boxes_path instead. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
-            },
             "optional": {
-                "box_format": (["xyxy", "cxcywh", "xywh"], {"default": "xyxy", "tooltip": "How to read each box's 4 numbers. xyxy = corners [x1,y1,x2,y2]. cxcywh = YOLO center [cx,cy,w,h]. xywh = top-left [x,y,w,h]. Most raw YOLO tensor dumps are cxcywh."}),
-                "boxes_path": ("STRING", {"default": "", "tooltip": "Recommended for large YOLO exports. Path to a .json OR a saved tensor-dump .txt on disk, so ComfyUI does not need to keep a giant detection string in the graph."}),
+                "boxes_data": (any_type, {"tooltip": "Wire your YOLO node's box output here (a tensor, or a list of per-frame tensors). This is the easiest way: no copy-paste. Set box_format to match (usually cxcywh for raw YOLO)."}),
+                "boxes": ("STRING", {"default": "", "multiline": True,
+                                     "tooltip": "Alternative to wiring boxes_data: paste JSON or a tensor dump here. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
+                "box_format": (["xyxy", "cxcywh", "xywh"], {"default": "xyxy", "tooltip": "How to read each box's 4 numbers. xyxy = corners [x1,y1,x2,y2]. cxcywh = YOLO center [cx,cy,w,h]. xywh = top-left [x,y,w,h]. Most raw YOLO outputs are cxcywh."}),
+                "boxes_path": ("STRING", {"default": "", "tooltip": "Alternative to wiring/pasting: path to a .json OR a saved tensor-dump .txt on disk."}),
                 "images": ("IMAGE", {"tooltip": "Optional. Used only to read width/height/frame-count."}),
                 "width": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame width if no images. 0 = infer from the boxes."}),
                 "height": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "Frame height if no images. 0 = infer from the boxes."}),
@@ -420,15 +478,21 @@ class BoxesToTracks:
     RETURN_NAMES = ("tracks",)
     FUNCTION = "convert"
     CATEGORY = DETECT_CATEGORY
-    DESCRIPTION = ("Turn boxes from any detector (YOLO, etc.) into TRACKS. Adds stable IDs "
-                   "across frames with an IoU linker, or uses the IDs your detector provides. "
-                   "For large YOLO runs, prefer boxes_path plus score / frame filters.")
+    DESCRIPTION = ("Turn boxes from any detector (YOLO, etc.) into TRACKS. Wire the detector's "
+                   "box output into boxes_data (or paste/point at a file), set box_format to match "
+                   "(cxcywh for raw YOLO), and it adds stable IDs across frames with an IoU linker "
+                   "or uses the IDs your detector provides.")
 
-    def convert(self, boxes, box_format="xyxy", boxes_path="", images=None, width=0, height=0,
+    def convert(self, boxes_data=None, boxes="", box_format="xyxy", boxes_path="",
+                images=None, width=0, height=0,
                 min_score=0.25, max_detections_per_frame=50, frame_stride=1,
                 max_frames=0, link=True, iou_thresh=0.3, max_age=10,
                 label="object", fps=24.0):
-        raw_frames, meta = load_box_payload(boxes, boxes_path)
+        # priority: a wired boxes_data, then a file path, then pasted text
+        if boxes_data is not None:
+            raw_frames, meta = _coerce_boxes_payload(boxes_data)
+        else:
+            raw_frames, meta = load_box_payload(boxes, boxes_path)
         used_indices = selected_frame_indices(len(raw_frames), frame_stride, max_frames)
 
         # figure out frame size
