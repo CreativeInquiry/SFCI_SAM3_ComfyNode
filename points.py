@@ -132,13 +132,13 @@ class TrackingResultsToTracks:
         return {
             "required": {
                 "tracking_results": ("STRING", {"forceInput": True,
-                                                "tooltip": "Wire the CoTracker node's tracking_results here."}),
+                                                "tooltip": "Wire the s9roll7 CoTracker node's 'tracking_results' output here. Do not type into this box — it only accepts a wired connection."}),
             },
             "optional": {
-                "tracks": ("TRACKS", {"tooltip": "Optional. Assign trajectories back to these objects. Without it, you get one 'points' object."}),
-                "images": ("IMAGE", {"tooltip": "Optional. Only used for frame size when there's no tracks input."}),
-                "label": ("STRING", {"default": "points"}),
-                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0}),
+                "tracks": ("TRACKS", {"tooltip": "Connect your SAM3 -> Tracks output here. This is the key step: without it, CoTracker tracks points across the whole image (background included). With it, only trajectories that started inside your detected object's mask are kept — everything else is discarded."}),
+                "images": ("IMAGE", {"tooltip": "Optional. Only needed for frame size when no tracks input is connected."}),
+                "label": ("STRING", {"default": "points", "tooltip": "Only used in standalone mode (when no tracks is connected). Sets the name given to all tracked point trajectories."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Frames per second of your video. Used when exporting to After Effects (JSX)."}),
                 "fill_missing_frames": ("BOOLEAN", {"default": False,
                                                     "tooltip": "Recommended OFF. OFF = only attach point tracks to frames that already exist in the EasyDetect result. ON = create synthetic per-frame detections from the tracked points when needed."}),
                 "discard_unmatched": ("BOOLEAN", {"default": True,

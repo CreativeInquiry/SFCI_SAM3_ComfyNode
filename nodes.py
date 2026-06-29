@@ -482,9 +482,9 @@ class BoxesToTracks:
     def INPUT_TYPES(cls):
         return {
             "optional": {
-                "boxes_data": (any_type, {"tooltip": "Wire your YOLO node's box output here (a tensor, or a list of per-frame tensors). This is the easiest way: no copy-paste. Set box_format to match (usually cxcywh for raw YOLO)."}),
+                "boxes_data": (any_type, {"tooltip": "Wire your YOLO node's box output here. This is the normal way to use this node. Leave the text field below empty when this is connected."}),
                 "boxes": ("STRING", {"default": "", "multiline": True,
-                                     "tooltip": "Alternative to wiring boxes_data: paste JSON or a tensor dump here. A box is [x1,y1,x2,y2], [x1,y1,x2,y2,score], or {\"bbox\":[...],\"score\":..,\"label\":..,\"id\":..}. Or {\"frames\":[...],\"width\":W,\"height\":H}."}),
+                                     "tooltip": "Leave this blank when a YOLO node is wired to boxes_data above — the wire always takes priority. This text box is only for pasting box coordinates directly as JSON when you have no live detector node."}),
                 "box_format": (["xyxy", "cxcywh", "xywh"], {"default": "xyxy", "tooltip": "How to read each box's 4 numbers. xyxy = corners [x1,y1,x2,y2]. cxcywh = YOLO center [cx,cy,w,h]. xywh = top-left [x,y,w,h]. Most raw YOLO outputs are cxcywh."}),
                 "boxes_path": ("STRING", {"default": "", "tooltip": "Alternative to wiring/pasting: path to a .json OR a saved tensor-dump .txt on disk."}),
                 "images": ("IMAGE", {"tooltip": "Optional. Used only to read width/height/frame-count."}),
@@ -499,7 +499,7 @@ class BoxesToTracks:
                 "max_age": ("INT", {"default": 10, "min": 0, "max": 300, "tooltip": "Frames an object may vanish for before its ID is retired."}),
                 "label": ("STRING", {"default": "object", "tooltip": "Default label when a box doesn't carry one. Ignored if class_names is provided and the detector emits a class id."}),
                 "class_names": ("STRING", {"default": "", "tooltip": "YOLO class names in order, comma-separated (e.g. 'person,bicycle,car,...'). When your YOLO detector adds a class index to each box (the 6th number), this maps it to a readable name. Leave blank to show the raw class number instead."}),
-                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Frames per second of your video. Used when exporting to After Effects (JSX)."}),
             },
         }
 
@@ -675,7 +675,7 @@ class UltralyticsYOLOToTracks:
                 "images": ("IMAGE", {"tooltip": "Your original video frames — connect this so the output coordinates match your video resolution, not the YOLO inference size."}),
                 "box_images": ("IMAGE", {"tooltip": "Wire the kadirnar YOLO node's IMAGE output here. If the YOLO node ran inference at a different size than your original video (e.g. 512x512 vs 1060x1886), this lets the node scale the box coordinates up to match your video."}),
                 "class_names": ("STRING", {"default": "",
-                    "tooltip": "YOLO class names in order, comma-separated (e.g. 'person,bicycle,car,...'). Maps the integer LABELS to readable names. Must match the order your YOLO model was trained on."}),
+                    "tooltip": "Paste the YOLO model's class names here in order, comma-separated (e.g. 'person,bicycle,car,...'). This maps the integer class IDs from LABELS (0, 1, 2...) to readable words like 'person' or 'car'. NOTE: this is on this node, not on the kadirnar YOLO node. The kadirnar 'classes' field filters detections by integer ID — this field here translates those IDs into words."}),
                 "min_score": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Drop detections with confidence below this."}),
                 "link": ("BOOLEAN", {"default": True,
