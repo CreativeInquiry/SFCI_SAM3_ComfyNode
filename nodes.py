@@ -672,8 +672,9 @@ class UltralyticsYOLOToTracks:
                 "labels": (any_type, {"tooltip": "Wire the kadirnar YOLO node's LABELS output here (integer class IDs, one list per frame)."}),
             },
             "optional": {
-                "images": ("IMAGE", {"tooltip": "Your original video frames — connect this so the output coordinates match your video resolution, not the YOLO inference size."}),
-                "box_images": ("IMAGE", {"tooltip": "Wire the kadirnar YOLO node's IMAGE output here. If the YOLO node ran inference at a different size than your original video (e.g. 512x512 vs 1060x1886), this lets the node scale the box coordinates up to match your video."}),
+                "images": ("IMAGE", {"tooltip": "Your original video frames. Connect this so the output coordinates match your full video resolution."}),
+                "inference_size": ("INT", {"default": 0, "min": 0, "max": 8192,
+                    "tooltip": "The image size the kadirnar YOLO node ran inference at (the 'height' and 'width' fields on that node, usually 512 or 640). Set this when your boxes appear in the wrong position on the original video. Leave at 0 if boxes already align correctly."}),
                 "class_names": ("STRING", {"default": "",
                     "tooltip": "Paste the YOLO model's class names here in order, comma-separated (e.g. 'person,bicycle,car,...'). This maps the integer class IDs from LABELS (0, 1, 2...) to readable words like 'person' or 'car'. NOTE: this is on this node, not on the kadirnar YOLO node. The kadirnar 'classes' field filters detections by integer ID — this field here translates those IDs into words."}),
                 "min_score": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -697,36 +698,29 @@ class UltralyticsYOLOToTracks:
                    "the YOLO model's class list so detections are labeled 'person', 'car', etc. "
                    "The IoU linker assigns stable IDs across frames for object identity.")
 
-    def convert(self, boxes, labels, images=None, box_images=None, class_names="",
+    def convert(self, boxes, labels, images=None, inference_size=0, class_names="",
                 min_score=0.25, link=True, iou_thresh=0.3, max_age=10, fps=24.0):
         name_list = [n.strip() for n in class_names.split(",") if n.strip()] if class_names.strip() else None
         box_frames = _ul_grids_to_frames(boxes)
         lbl_frames = _ul_labels_to_frames(labels, name_list)
         n_frames = max(len(box_frames), len(lbl_frames), 1)
 
-        # Target size: the original video frames
         H, W = 1, 1
         if images is not None:
             n_frames = max(n_frames, int(images.shape[0]))
             H, W = int(images.shape[1]), int(images.shape[2])
-
-        # Source size: the image YOLO actually ran on (may differ from original video)
-        box_H = int(box_images.shape[1]) if box_images is not None else H
-        box_W = int(box_images.shape[2]) if box_images is not None else W
-
-        # Fall back to inferring from box extents if we still have no size
-        if (not H or not W) and box_frames:
+        elif box_frames:
             flat = [b for f in box_frames for b in f]
             if flat:
-                W = box_W = max(int(math.ceil(max(b[2] for b in flat))), 1)
-                H = box_H = max(int(math.ceil(max(b[3] for b in flat))), 1)
+                W = max(int(math.ceil(max(b[2] for b in flat))), 1)
+                H = max(int(math.ceil(max(b[3] for b in flat))), 1)
 
-        # Scale factors: map from YOLO inference space to original video space
-        scale_x = (W / box_W) if box_W else 1.0
-        scale_y = (H / box_H) if box_H else 1.0
-        if scale_x != 1.0 or scale_y != 1.0:
+        box_S = int(inference_size) if inference_size and inference_size > 0 else 0
+        scale_x = (W / box_S) if box_S else 1.0
+        scale_y = (H / box_S) if box_S else 1.0
+        if box_S:
             print(f"[EasyTrack] UltralyticsYOLOToTracks: scaling boxes "
-                  f"from {box_W}x{box_H} to {W}x{H}")
+                  f"from {box_S}x{box_S} to {W}x{H}")
 
         tracks = Tracks(height=int(H), width=int(W),
                         num_frames=n_frames, fps=float(fps))
