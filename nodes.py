@@ -623,51 +623,62 @@ def _ul_grids_to_frames(grids):
     return frames
 
 
-def _ul_labels_to_frames(labels):
-    """Parse the 'labels' output from comfyui-ultralytics-yolo into
-    a list-of-frames, each frame a list of string class names."""
+def _ul_labels_to_frames(labels, class_names=None):
+    """Parse a 'labels' output (strings OR integer/float class IDs) into
+    a list-of-frames, each frame a list of string labels.
+
+    shadowcz007 sends strings ("person", "car").
+    kadirnar sends integer/float class IDs (0.0, 3.0) from .cls.tolist().
+    class_names maps those IDs to readable names (e.g. ['person','car',...]).
+    """
+    def _resolve(l):
+        try:
+            cls_id = int(float(l))
+            if class_names and cls_id < len(class_names):
+                return class_names[cls_id]
+            return str(cls_id)
+        except (ValueError, TypeError):
+            return str(l)
+
     if labels is None:
         return []
+    if isinstance(labels, (int, float)):
+        return [[_resolve(labels)]]
     if isinstance(labels, str):
         return [[labels]]
     if not isinstance(labels, (list, tuple)) or not labels:
         return []
     first = labels[0]
-    if isinstance(first, str):
-        return [list(labels)]   # flat list = single frame
     if isinstance(first, (list, tuple)):
-        return [[str(l) for l in frame] for frame in labels]
-    return []
+        return [[_resolve(l) for l in frame] for frame in labels]
+    return [[_resolve(l) for l in labels]]   # flat list = single frame
 
 
 class UltralyticsYOLOToTracks:
     """
-    Adapter for shadowcz007/comfyui-ultralytics-yolo.
+    Adapter for kadirnar/ComfyUI-YOLO (UltralyticsInference node).
 
-    That node outputs bounding boxes ('grids') and class names ('labels') as
-    two separate outputs. Wire both here. Class names come from the YOLO model
-    directly, so no class_names list is needed. The IoU linker assigns stable
-    ids across frames so each detection has a coherent identity.
-
-    Set box_format to match the node's coordinate system (xyxy is Ultralytics'
-    default).
+    Wire the node's BOXES output to 'boxes' and LABELS to 'labels'. BOXES
+    are in center-based xywh format; LABELS are integer class IDs (0, 1, 3...).
+    Paste class_names in COCO order so IDs become readable labels like 'person'
+    or 'car'. The IoU linker assigns stable IDs across frames.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "grids": (any_type, {"tooltip": "Wire the Ultralytics YOLO node's 'grids' output here (bounding box coordinates, one list per frame)."}),
-                "labels": (any_type, {"tooltip": "Wire the Ultralytics YOLO node's 'labels' output here (class names as strings, e.g. 'person', 'car', one list per frame)."}),
+                "boxes": (any_type, {"tooltip": "Wire the kadirnar YOLO node's BOXES output here (center-based xywh coordinates, one tensor per frame)."}),
+                "labels": (any_type, {"tooltip": "Wire the kadirnar YOLO node's LABELS output here (integer class IDs, one list per frame)."}),
             },
             "optional": {
                 "images": ("IMAGE", {"tooltip": "The original video frames. Used to read frame size."}),
-                "box_format": (["xyxy", "xywh", "cxcywh"], {"default": "xyxy",
-                    "tooltip": "Coordinate format of the grids output. Ultralytics uses xyxy by default."}),
+                "class_names": ("STRING", {"default": "",
+                    "tooltip": "YOLO class names in order, comma-separated (e.g. 'person,bicycle,car,...'). Maps the integer LABELS to readable names. Must match the order your YOLO model was trained on."}),
                 "min_score": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Drop detections with confidence below this. The grids may carry a 5th number for confidence."}),
+                    "tooltip": "Drop detections with confidence below this."}),
                 "link": ("BOOLEAN", {"default": True,
-                    "tooltip": "Assign stable IDs across frames with an IoU linker. Turn OFF only if each frame is independent."}),
+                    "tooltip": "Assign stable IDs across frames with an IoU linker."}),
                 "iou_thresh": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "How much two boxes must overlap to count as the same object across frames."}),
                 "max_age": ("INT", {"default": 10, "min": 0, "max": 300,
@@ -680,15 +691,17 @@ class UltralyticsYOLOToTracks:
     RETURN_NAMES = ("tracks",)
     FUNCTION = "convert"
     CATEGORY = DETECT_CATEGORY
-    DESCRIPTION = ("Adapter for shadowcz007/comfyui-ultralytics-yolo. Wire 'grids' (bounding "
-                   "boxes) and 'labels' (string class names) from that node. Class names come "
-                   "from the YOLO model itself — no class_names list needed here. Use "
-                   "BoxesToTracks for other YOLO nodes that bundle labels into the box tensor.")
+    DESCRIPTION = ("Adapter for kadirnar/ComfyUI-YOLO. Wire BOXES (center-based xywh) and LABELS "
+                   "(integer class IDs) from the UltralyticsInference node. Set class_names to "
+                   "the YOLO model's class list so detections are labeled 'person', 'car', etc. "
+                   "The IoU linker assigns stable IDs across frames for object identity.")
 
-    def convert(self, grids, labels, images=None, box_format="xyxy",
+    def convert(self, boxes, labels, images=None, class_names="",
                 min_score=0.25, link=True, iou_thresh=0.3, max_age=10, fps=24.0):
-        box_frames = _ul_grids_to_frames(grids)
-        lbl_frames = _ul_labels_to_frames(labels)
+        name_list = [n.strip() for n in class_names.split(",") if n.strip()] if class_names.strip() else None
+        # kadirnar BOXES are center-based xywh (boxes.xywh from Ultralytics)
+        box_frames = _ul_grids_to_frames(boxes)
+        lbl_frames = _ul_labels_to_frames(labels, name_list)
         n_frames = max(len(box_frames), len(lbl_frames), 1)
 
         H, W = 1, 1
@@ -716,7 +729,7 @@ class UltralyticsYOLOToTracks:
                 score = float(box[4]) if len(box) > 4 else 1.0
                 if score < min_score:
                     continue
-                xy = _convert_box(box[:4], box_format)
+                xy = _convert_box(box[:4], "cxcywh")
                 dets.append({"bbox": xy, "label": raw_labels[j] if j < len(raw_labels) else "",
                              "score": score})
 
