@@ -18,6 +18,7 @@ from .nodes import (
     SAM3TrackToTracks,
     BoxesToTracks,
     UltralyticsYOLOToTracks,
+    LocateAnythingToTracks,
     EasyTracksExport,
     EasyTracksLoad,
     EasyTracksPreview,
@@ -29,6 +30,7 @@ NODE_CLASS_MAPPINGS = {
     "SAM3TrackToTracks": SAM3TrackToTracks,
     "BoxesToTracks": BoxesToTracks,
     "UltralyticsYOLOToTracks": UltralyticsYOLOToTracks,
+    "LocateAnythingToTracks": LocateAnythingToTracks,
     "TrackingResultsToTracks": TrackingResultsToTracks,
     # --- use a TRACKS ---
     "EasyTracksPreview": EasyTracksPreview,
@@ -40,6 +42,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3TrackToTracks": "SAM3 \u2192 Tracks",
     "BoxesToTracks": "YOLO Boxes \u2192 Tracks",
     "UltralyticsYOLOToTracks": "Ultralytics YOLO \u2192 Tracks",
+    "LocateAnythingToTracks": "LocateAnything \u2192 Tracks",
     "TrackingResultsToTracks": "CoTracker \u2192 Tracks",
     "EasyTracksPreview": "Tracks Preview",
     "EasyTracksExport": "Tracks Export (json/csv/svg/jsx)",

@@ -766,6 +766,129 @@ class UltralyticsYOLOToTracks:
         return (tracks,)
 
 
+# ---- LocateAnything -> TRACKS -----------------------------------------------
+
+def _parse_locate_anything(data):
+    """Parse LocateAnything locations_json into (frames_dict, W, H).
+
+    frames_dict: {batch_index: [{"bbox":[x1,y1,x2,y2], "label":str, "score":1.0}]}
+    pixel coords are already xyxy absolute. Label comes from the first non-empty
+    box label, falling back to the label extracted from the prompt string.
+    """
+    import re
+    if isinstance(data, str):
+        data = json.loads(data)
+    if isinstance(data, dict):
+        data = [data]
+
+    frames, W, H = {}, 0, 0
+    for item in (data or []):
+        fi = int(item.get("batch_index", 0))
+        locs = item.get("locations", {})
+        img_size = locs.get("image_size", {})
+        W = max(W, int(img_size.get("width", 0)))
+        H = max(H, int(img_size.get("height", 0)))
+
+        # pull label from prompt ("...description: cars.") as fallback
+        prompt_label = ""
+        m = re.search(r"description:\s*(.+?)\.?\s*$", item.get("prompt", ""), re.I)
+        if m:
+            prompt_label = m.group(1).strip().rstrip(".")
+
+        raw_boxes = locs.get("boxes", [])
+        # first non-empty label wins for the whole frame (LocateAnything only
+        # labels the first box; the rest come back as "")
+        frame_label = next((b["label"] for b in raw_boxes if b.get("label")),
+                           prompt_label)
+
+        dets = []
+        for box in raw_boxes:
+            px = box.get("pixel")
+            if not px or len(px) < 4:
+                continue
+            x1, y1, x2, y2 = float(px[0]), float(px[1]), float(px[2]), float(px[3])
+            dets.append({"bbox": [x1, y1, x2, y2],
+                         "label": box.get("label") or frame_label,
+                         "score": 1.0})
+        if dets:
+            frames[fi] = dets
+
+    return frames, W, H
+
+
+class LocateAnythingToTracks:
+    """
+    Adapter for LocateAnything. Wire its 'locations_json' output here.
+    Each batch_index in the JSON maps to one video frame. The pixel-space
+    xyxy boxes are used directly; labels come from the prompt text.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "locations_json": ("STRING", {"forceInput": True,
+                    "tooltip": "Wire the LocateAnything node's 'locations_json' output here."}),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "Your original video frames. Used to set frame count and size."}),
+                "link": ("BOOLEAN", {"default": True,
+                    "tooltip": "Assign stable IDs across frames with an IoU linker."}),
+                "iou_thresh": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "How much two boxes must overlap to count as the same object across frames."}),
+                "max_age": ("INT", {"default": 10, "min": 0, "max": 300,
+                    "tooltip": "Frames an object can vanish for before its ID is retired."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 1.0,
+                    "tooltip": "Frames per second of your video."}),
+            },
+        }
+
+    RETURN_TYPES = ("TRACKS",)
+    RETURN_NAMES = ("tracks",)
+    FUNCTION = "convert"
+    CATEGORY = DETECT_CATEGORY
+    DESCRIPTION = ("Adapter for LocateAnything. Wire its 'locations_json' output here. "
+                   "Converts detected boxes and labels into TRACKS with stable IDs across "
+                   "frames using an IoU linker — the same format as the YOLO and SAM3 adapters.")
+
+    def convert(self, locations_json, images=None, link=True,
+                iou_thresh=0.3, max_age=10, fps=24.0):
+        frames_dict, W, H = _parse_locate_anything(locations_json)
+
+        n_frames = (max(frames_dict.keys()) + 1) if frames_dict else 1
+        if images is not None:
+            n_frames = max(n_frames, int(images.shape[0]))
+            H = H or int(images.shape[1])
+            W = W or int(images.shape[2])
+
+        tracks = Tracks(height=int(H or 1), width=int(W or 1),
+                        num_frames=n_frames, fps=float(fps))
+        linker = IoULinker(iou_thresh, max_age) if link else None
+        next_id, kept = 0, 0
+
+        for fi in sorted(frames_dict.keys()):
+            dets = frames_dict[fi]
+            if linker is not None:
+                ids = linker.update(fi, [d["bbox"] for d in dets])
+            else:
+                ids = list(range(next_id, next_id + len(dets)))
+                next_id += len(dets)
+            for d, oid in zip(dets, ids):
+                x1, y1, x2, y2 = d["bbox"]
+                tracks.add(int(oid), fi, FrameDet(
+                    bbox=[x1, y1, x2, y2],
+                    point=[round((x1 + x2) / 2, 2), round((y1 + y2) / 2, 2)],
+                    area=int(max(x2 - x1, 0) * max(y2 - y1, 0)),
+                    score=d["score"],
+                    visible=True,
+                ), label=d["label"], score=d["score"])
+                kept += 1
+
+        print(f"[EasyTrack] LocateAnythingToTracks -> {tracks!r} "
+              f"({kept} detections across {len(frames_dict)} frames)")
+        return (tracks,)
+
+
 # =============================================================================
 # PART 2 - USE A TRACKS  (export / load / preview)
 # =============================================================================
