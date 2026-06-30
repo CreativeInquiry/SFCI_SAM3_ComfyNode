@@ -53,26 +53,66 @@ That can mean a few different things:
 
 This is where **SAM3**, **YOLO**, and **CoTracker** each fit.
 
-### SAM3, YOLO, and CoTracker
+### SAM3, YOLO, LocateAnything, and CoTracker
 
 These tools overlap a little, but they do different jobs.
 
 - **SAM3** tracks **objects**. It is good at answering: "Which pixels are the bee?"
-- **YOLO** detects **boxes**. It is good at answering: "Where is the bee, roughly?"
+- **YOLO** detects **boxes**. It is good at answering: "Where is this common object, roughly?"
+- **LocateAnything** detects **boxes from a text prompt**. It is good at answering: "Where are the cars?" for any object you can describe in words.
 - **CoTracker** tracks **points**. It is good at answering: "How did these little points move?"
 
 So:
 
 - Use **SAM3** when you want masks, contours, silhouettes, or shape-based art.
-- Use **YOLO** when you want a simpler box-based detection workflow.
+- Use **YOLO** when your object is one of its 80 trained classes (person, car, dog...).
+- Use **LocateAnything** when you want box detections for any object you can describe in words, and you don't need a pixel mask.
 - Use **CoTracker** when you want motion trails, point movement, gesture lines, or denser motion data.
 - Use **SAM3 + CoTracker** when you want both: "find the bee as an object, then give me rich motion paths on top of it."
 
 In this repo, that means:
 
-- **SAM3 -> EasyDetect SAM3 -> Tracks** is the richer, shape-aware detection path.
-- **YOLO -> EasyDetect Boxes -> Tracks** is the simpler, box-based detection path.
-- Either of those can then feed **EasyTrack** if you want point-motion on top.
+- **SAM3 -> SAM3 → Tracks** is the richer, shape-aware detection path.
+- **YOLO -> Ultralytics YOLO → Tracks** is the simpler, box-based detection path for common objects.
+- **LocateAnything -> LocateAnything → Tracks** is the text-prompt box detection path for anything else.
+- Any of those can then feed **CoTracker → Tracks** if you want point-motion on top.
+
+### How identity works across frames
+
+Every detector in this list — SAM3, YOLO, LocateAnything — looks at each video
+frame independently. None of them have memory. When YOLO finds a car in frame 5,
+it has no idea it found a car in frame 4. It cannot know whether they are the same
+car.
+
+This is the problem that **identity coherence** solves: giving the same object the
+same ID across every frame, so that "car 0" in frame 5 is the same car as "car 0"
+in frame 47.
+
+**How we solve it: the IoU linker.** The YOLO → Tracks and LocateAnything → Tracks
+nodes include a built-in IoU linker. It checks whether a box in the current frame
+overlaps enough with a box from the previous frame. If it does, the same ID is
+kept. If not, a new ID is assigned.
+
+This works well as long as objects move slowly relative to their size. If a car
+moves less than about its own width between frames, the boxes will overlap and the
+ID will be stable.
+
+**The limitation.** If an object moves fast, disappears behind something, or is
+briefly off-screen, the IoU linker may assign it a new ID when it comes back.
+The `max_age` setting gives an object a grace period (default 10 frames) to
+reappear before its ID is retired.
+
+SAM3 handles identity differently -- it uses its own internal video tracking across
+frames, so objects keep stable IDs even through fast motion and occlusions. This is
+one reason SAM3 tends to give better results for tracking a single specific thing
+over a long video.
+
+**Can CoTracker improve identity?** Not directly. CoTracker adds dense motion
+trajectories on top of the detected objects -- it does not help re-identify an
+object that got a new ID. What it does add is rich per-object motion data: instead
+of just knowing where the car was each frame (one box), you get dozens of tracked
+points showing exactly how different parts of the car moved. For motion-based art,
+that is usually more useful than the box alone.
 
 ### "But I want to track a bee, and YOLO doesn't know what a bee is"
 
@@ -235,28 +275,59 @@ A purpose-built adapter for the kadirnar YOLO node. Wire that node's `BOXES`
 output to `boxes` and its `LABELS` output to `labels`. Set `class_names` to
 your model's class list so integer IDs (0, 3, 47...) become readable names.
 
+If your boxes appear in the wrong position on the original video, set
+`inference_size` to match the kadirnar node's `height`/`width` setting (usually
+512 or 640). This scales the coordinates from the inference resolution back to
+your video's full resolution. Leave it at 0 if boxes already align correctly.
+
 Remember: if your object is not in the model's training set (e.g. "bee" is not
 in COCO), YOLO will not detect it. Use SAM3 for custom or unusual objects.
 
+**LocateAnything -> Tracks**
+
+Wire the LocateAnything node's `locations_json` output here. The label comes
+from your text prompt automatically ("Locate all cars" → label "cars"). Uses
+the same IoU linker as YOLO for stable IDs across frames.
+
 ### Part 2: EasyTrack adds point motion (optional)
 
-**EasyTrack Tracks -> CoTracker Points**
-
-This node prepares points for CoTracker. It looks at each detected object and
-seeds `x,y` points inside it, formatted the way the CoTracker node expects.
-
-**EasyTrack CoTracker Results -> Tracks**
+**CoTracker -> Tracks**
 
 This node takes CoTracker's returned trajectories and writes them back into the
 same `TRACKS` object as `track_points` and `track_visible`.
 
-This is useful when object-level data is not enough and you want denser motion
-for trails, particles, deformation, gesture, or animation-driven art.
+**What does this actually add, and do I need it?**
 
-By default it only adds point tracks to frames that already came from
-**EasyDetect**, which keeps the logic clean for students. There is also an
-escape hatch, `fill_missing_frames`, if you intentionally want to create frames
-from point tracking alone.
+SAM3 gives you one point per frame per object: the centroid. That point traces
+the object's path through space. For many art pieces, that is enough.
+
+CoTracker gives you many points per frame per object. Instead of one dot at the
+center of the bee, you get 20, 50, or 100 dots scattered across the bee's body,
+each one tracking where it specifically went. This tells you things SAM3 cannot:
+
+- How are the wings moving relative to the body?
+- Is the bee rotating as it flies?
+- How does the shape of the bee deform over time?
+
+**Use CoTracker when you want:**
+- Particle effects that spray off specific body parts, not just the center
+- Motion vectors to drive a shader or deformation rig
+- Gesture lines that follow individual limbs, not just the whole object
+- Denser, more organic motion data than a single path
+
+**Skip CoTracker when you only need to know where the object is overall.** If
+your art piece draws a dot that follows the bee, SAM3's centroid is sufficient.
+
+**How to use it with SAM3:**
+
+Connect your SAM3 → Tracks result to the `tracks` input. This is the key step.
+Without it, CoTracker tracks points across the whole image — background and all.
+With it, only trajectories that started inside the detected object's mask are
+kept; everything else is thrown away. You get motion data only about the bee.
+
+The `track_point_size` setting on the **Tracks Preview** node controls how big
+each CoTracker dot appears in the preview image (radius in pixels, default 4).
+Raise it if the dots are hard to see; lower it if they feel cluttered.
 
 ### Part 3: Using the `TRACKS` datatype
 
@@ -266,7 +337,8 @@ This node draws the point, box, contour, IDs, and point trajectories onto the
 frames so you can see whether the result makes sense.
 
 Switches:
-`draw_boxes`, `draw_contours`, `draw_points`, `draw_tracks`, `draw_ids`
+`draw_boxes`, `draw_contours`, `draw_points`, `draw_tracks`, `draw_ids`,
+`track_point_size`
 
 `images` is optional. If you leave it unconnected, the node draws onto a black
 canvas at the right size.
